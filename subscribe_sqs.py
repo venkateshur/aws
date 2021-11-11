@@ -22,6 +22,19 @@ def delete_message(queue_url, receipt_handle):
     logger.info('Received and deleted message: %s' % message)
 
 
+MessageBody = """{"bucket": "", "prefix": "","file": "*.json"}"""
+
+
+def publish_message(queue_url, message_body):
+    response = sqs.send_message(
+        QueueUrl=queue_url,
+        DelaySeconds=10,
+        MessageBody=message_body)
+
+    print(response['MessageId'])
+    logger.info('Received and deleted message: %s' % message)
+
+
 def subscribe_sqs(queue_url):
     try:
         response = sqs.receive_message(
