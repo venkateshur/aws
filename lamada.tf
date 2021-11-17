@@ -2,7 +2,7 @@
 # SQS OF SNS SUBSCRIPTIONS #
 #==========================#
 resource "aws_sqs_queue" "sqs-edp-forpurpose-to-oneup" {
-  name                       = "edp-sqs-rawintegration"
+  name                       = "edp-sqs-forpurpose-to-oneup"
   receive_wait_time_seconds  = 10
   tags                       = var.required_common_tags
   kms_master_key_id          = data.aws_kms_key.eds_platform_sqs_key.id
@@ -53,7 +53,7 @@ resource "aws_sqs_queue_policy" "sqs-edp-forpurpose-to-oneup_policy" {
 # SQS OF SNS SUBSCRIPTIONS - DEAD LETTER #
 #========================================#
 resource "aws_sqs_queue" "sqs-edp-forpurpose-to-oneup_dlq" {
-  name                      = "edp-sqs-rawintegration-dlq"
+  name                      = "edp-sqs-forpurpose-to-oneup-dlq"
   receive_wait_time_seconds = 10
   tags                      = var.required_common_tags
   kms_master_key_id         = data.aws_kms_key.eds_platform_sqs_key.id
@@ -111,7 +111,7 @@ resource "aws_lambda_function" "lambda-edp-forpurpose-to-oneup" {
   role             = aws_iam_role.lambda-edp-forpurpose-to-oneup_role.arn
   s3_bucket        = aws_s3_bucket_object.lambda-edp-forpurpose-to-oneup_s3_zip.bucket
   s3_key           = aws_s3_bucket_object.lambda-edp-forpurpose-to-oneup_s3_zip.key
-  source_code_hash = filebase64sha256("lambda/lambda-raw-intg-event.zip")
+  source_code_hash = filebase64sha256("lambda/lambda-forpurpose-to-oneup-event.zip")
   runtime          = "python3.7"
 
   environment {
@@ -124,24 +124,24 @@ resource "aws_lambda_function" "lambda-edp-forpurpose-to-oneup" {
   tags = var.required_common_tags
 
   vpc_config {
-    security_group_ids = [aws_security_group.edp_lambda_rawintegration_sg.id]
+    security_group_ids = [aws_security_group.edp_lambda_forpurpose-to-oneup.id]
     subnet_ids         = data.aws_subnet_ids.golden_vpc_subnets.ids
   }
 
 }
 
-resource "aws_lambda_event_source_mapping" "edp_lambda_rawintegration_mapping" {
+resource "aws_lambda_event_source_mapping" "edp_lambda_forpurpose-to-oneup_mapping" {
   batch_size       = 1
   event_source_arn = aws_sqs_queue.sqs-edp-forpurpose-to-oneup.arn
   enabled          = true
-  function_name    = aws_lambda_function.edp_lambda_rawintegration.arn
+  function_name    = aws_lambda_function.edp_lambda_forpurpose-to-oneup.arn
 }
 
 #============================#
 # ROLE AND POLICY FOR LAMBDA #
 #============================#
-resource "aws_iam_role" "edp_lambda_rawintegration_role" {
-  name               = "edp-lambda-rawintegration-role"
+resource "aws_iam_role" "edp_lambda_forpurpose-to-oneup_role" {
+  name               = "edp-lambda-forpurpose-to-oneup-role"
   path               = "/tf/"
   assume_role_policy = <<-EOF
 {
@@ -161,15 +161,15 @@ resource "aws_iam_role" "edp_lambda_rawintegration_role" {
 EOF
 }
 
-resource "aws_iam_role_policy_attachment" "edp_lambda_rawintegration_attach_vpc_access_ingestion" {
-  role       = aws_iam_role.edp_lambda_rawintegration_role.name
+resource "aws_iam_role_policy_attachment" "edp_lambda_forpurpose-to-oneup_attach_vpc_access_ingestion" {
+  role       = aws_iam_role.edp_lambdaforpurpose-to-oneup_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
-resource "aws_iam_role_policy" "edp_lambda_rawintegration_role_policy" {
+resource "aws_iam_role_policy" "edp_lambda_forpurpose-to-oneup_role_policy" {
   depends_on = [time_sleep.wait_60_seconds_lambda]
-  name       = "edp-lambda-rawintegration-policy"
-  role       = aws_iam_role.edp_lambda_rawintegration_role.id
+  name       = "edp-lambda-forpurpose-to-oneup-policy"
+  role       = aws_iam_role.edp_lambda_forpurpose-to-oneup_role.id
   policy     = <<-EOF
 {
   "Version": "2012-10-17",
@@ -205,7 +205,19 @@ resource "aws_iam_role_policy" "edp_lambda_rawintegration_role_policy" {
       "Effect": "Allow",
       "Action": "kms:Decrypt",
       "Resource": "${data.aws_kms_key.eds_platform_sqs_key.arn}"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::mybucket/path/to/my/key"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::mybucket/path/to/my/key"
     }
+  ]
+}
   ]
 }
 EOF
@@ -215,28 +227,28 @@ EOF
 # SLEEP FOR LAMBDA #
 #==================#
 resource "time_sleep" "wait_60_seconds_lambda" {
-  depends_on      = [aws_lambda_function.edp_lambda_rawintegration]
+  depends_on      = [aws_lambda_function.edp_lambda_forpurpose-to-oneup]
   create_duration = "60s"
 }
 
 #===========================#
 # S3 OBJECT FOR LAMBDA CODE #
 #===========================#
-resource "aws_s3_bucket_object" "edp_lambda_rawintegration_s3_zip" {
+resource "aws_s3_bucket_object" "edp_lambda_forpurpose-to-oneup_s3_zip" {
   bucket = "evernorth-us-edp-${var.env}-artifacts"
   key    = "lambda/ingestions/s3_sqs_lambda_ingestion.zip"
-  source = "lambda/lambda-raw-intg-event.zip"
+  source = "lambda/lambda-forpurpose-to-oneup.zip"
 
   # The filemd5() function is available in Terraform 0.11.12 and later
   # For Terraform 0.11.11 and earlier, use the md5() function and the file() function:
   # etag = "${md5(file("path/to/file"))}"
-  etag = filemd5("./lambda/lambda-raw-intg-event.zip")
+  etag = filemd5("./lambda/lambda-forpurpose-to-oneup.zip")
 }
 
 #===========================#
 # SECURITY GROUP FOR LAMBDA #
 #===========================#
-resource "aws_security_group" "edp_lambda_rawintegration_sg" {
+resource "aws_security_group" "edp_lambda_forpurpose-to-oneup_sg" {
   name        = "${var.acct_abbr}-${var.project_name}-lambda"
   description = "Allow all outbound for Lambda"
   vpc_id      = data.aws_vpc.golden_vpc.id
