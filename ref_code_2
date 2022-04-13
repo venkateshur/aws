@@ -1,0 +1,2209 @@
+# Databricks notebook source
+# Databricks notebook source
+"""
+Importing all required packages for the all the following logic in the notebook
+"""
+import logging
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType, BooleanType, LongType, Row
+from pyspark.sql.functions import  col,struct, explode_outer, posexplode_outer, explode, lit, udf, struct, spark_partition_id, collect_list, lit, from_json, concat
+from datetime import datetime
+from delta.tables import *
+import yaml
+from urllib.parse import urlparse
+import re
+import os
+import boto3
+import traceback
+import json
+import math
+import sys
+import configparser
+
+from pyspark.sql.functions import current_timestamp, lit, input_file_name, row_number, col, concat, md5, trim, col, to_timestamp, to_date, when, expr
+from pyspark.sql.window import Window
+from urllib.parse import urlparse
+from jsonschema import validate
+from datetime import datetime
+from dateutil import relativedelta
+from delta.tables import *
+from common_dq.service.dq_processor import DataQualityProcessor
+from common_dq.service.dq_utils import *
+from pyspark.sql.types import *
+
+import re
+import os
+import json
+import yaml
+import boto3
+import time
+from decimal import *
+from typing import cast, Dict, List
+from collections import defaultdict
+import watchtower
+import secrets
+
+
+# COMMAND ----------
+
+def download_yaml_from_s3(s3_uri):
+    """
+    Downloads the YAML file from given s3_uri.
+    Returns the value as a dictionary.
+    Arguments:
+    s3_uri -- the s3 URI in format s3://bucket/path/to/file.yaml
+    Returns:
+    YAML content loaded into a dictionary.
+    """
+    if s3_uri is None or not s3_uri.startswith("s3://"):
+        raise Exception('no or invalid S3 URI supplied')
+
+    parse_result = urlparse(s3_uri)
+    bucket = parse_result.netloc
+    path = parse_result.path
+
+    if path.startswith("/"):
+        path = path[1:]
+
+    if not bucket or not path or len(path) <= 1:
+        raise Exception('invalid bucket name or path to file supplied')
+
+    try:
+        s3_client = boto3.client('s3')
+        response = s3_client.get_object(Bucket=bucket, Key=path)
+        return yaml.safe_load(response["Body"])
+    except Exception as exc:
+        raise exc
+
+def flatten_df(nested_df):
+    """
+    flatten the incoming struct type/ nested columns in the data frame input given
+    """
+    flat_cols = [c[0] for c in nested_df.dtypes if c[1][:6] != 'struct']
+    nested_cols = [c[0] for c in nested_df.dtypes if c[1][:6] == 'struct']
+    flat_df = nested_df.select(flat_cols +
+                            [col(nc+'.'+c).alias(nc+'_'+c)
+                                for nc in nested_cols
+                                for c in nested_df.select(nc+'.*').columns])
+    return flat_df
+
+
+@udf("string")
+def time_format_convert(value, from_format, to_format):
+    """
+    convert time column given from a given python datetime format to target format if the incoming value is not null
+    """
+    if value:
+      date_time_obj = datetime.strptime(value, from_format)
+      return date_time_obj.strftime(to_format)
+    else:
+      return value
+
+def get_all_s3_keys(s3_path, s3_client):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        #print(resp['KeyCount'])
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].endswith(".json") and not obj['Key'].split('/')[-1].startswith('.'):
+                keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+
+  
+def get_custom_s3_keys(s3_path, s3_client,custom_load_filter):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].split('/')[2].split('/')[0] == custom_load_filter:
+                #print(obj['Key'])
+                if obj['Key'].endswith(".json") and not(obj['Key'].split('/')[-1].startswith('.')):
+                  keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+
+#config.get('source',{}).get('path',{})
+
+
+def create_table_database(logger, db_name, db_location):
+    """
+    Create the database on Hive metastore on the db_location.
+    If the database already exists in the given location, this will be a no-op.
+    Arguments:
+    db_name -- the name of the database to be created
+    db_location -- location in HDFS/S3/DBFS where it needs to be created
+    Throws:
+    Exception if a database with the same name already exists in a different location.
+    """
+    logger.info(f"Creating database {db_name} at '{db_location}'")
+    spark.sql(
+        f"""
+    CREATE DATABASE IF NOT EXISTS {db_name} LOCATION '{db_location}';
+    """
+    )
+    logger.info(f"created database {db_name} at '{db_location}'")
+
+
+def check_is_folder(path):
+    """
+    check provided is a folder or file and append the schema name to path
+    """
+    if path.endswith("/"):
+        return f"{path}"
+    else:
+        return f"{path}/"
+
+def check_table_exist(db_name,table_name):
+    """
+    """
+    try:
+        df=spark.sql(f'SHOW TABLES IN  {db_name} like "{table_name}"')
+        if df.count == 1:
+            return True
+        else:
+            return False
+    except AnalysisException as err:
+        log.error(err)
+        return False
+
+# COMMAND ----------
+# Databricks notebook source
+# Databricks notebook source
+"""
+Importing all required packages for the all the following logic in the notebook
+"""
+import logging
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType, BooleanType, LongType, Row
+from pyspark.sql.functions import  col,struct, explode_outer, posexplode_outer, explode, lit, udf, struct, spark_partition_id, collect_list, lit, from_json, concat
+from datetime import datetime
+from delta.tables import *
+import yaml
+from urllib.parse import urlparse
+import re
+import os
+import boto3
+import traceback
+import json
+import math
+import sys
+import configparser
+
+from pyspark.sql.functions import current_timestamp, lit, input_file_name, row_number, col, concat, md5, trim, col, to_timestamp, to_date, when, expr
+from pyspark.sql.window import Window
+from urllib.parse import urlparse
+from jsonschema import validate
+from datetime import datetime
+from dateutil import relativedelta
+from delta.tables import *
+from common_dq.service.dq_processor import DataQualityProcessor
+from common_dq.service.dq_utils import *
+from pyspark.sql.types import *
+
+import re
+import os
+import json
+import yaml
+import boto3
+import time
+from decimal import *
+from typing import cast, Dict, List
+from collections import defaultdict
+import watchtower
+import secrets
+
+
+# COMMAND ----------
+
+def download_yaml_from_s3(s3_uri):
+    """
+    Downloads the YAML file from given s3_uri.
+    Returns the value as a dictionary.
+    Arguments:
+    s3_uri -- the s3 URI in format s3://bucket/path/to/file.yaml
+    Returns:
+    YAML content loaded into a dictionary.
+    """
+    if s3_uri is None or not s3_uri.startswith("s3://"):
+        raise Exception('no or invalid S3 URI supplied')
+
+    parse_result = urlparse(s3_uri)
+    bucket = parse_result.netloc
+    path = parse_result.path
+
+    if path.startswith("/"):
+        path = path[1:]
+
+    if not bucket or not path or len(path) <= 1:
+        raise Exception('invalid bucket name or path to file supplied')
+
+    try:
+        s3_client = boto3.client('s3')
+        response = s3_client.get_object(Bucket=bucket, Key=path)
+        return yaml.safe_load(response["Body"])
+    except Exception as exc:
+        raise exc
+
+def flatten_df(nested_df):
+    """
+    flatten the incoming struct type/ nested columns in the data frame input given
+    """
+    flat_cols = [c[0] for c in nested_df.dtypes if c[1][:6] != 'struct']
+    nested_cols = [c[0] for c in nested_df.dtypes if c[1][:6] == 'struct']
+    flat_df = nested_df.select(flat_cols +
+                            [col(nc+'.'+c).alias(nc+'_'+c)
+                                for nc in nested_cols
+                                for c in nested_df.select(nc+'.*').columns])
+    return flat_df
+
+
+@udf("string")
+def time_format_convert(value, from_format, to_format):
+    """
+    convert time column given from a given python datetime format to target format if the incoming value is not null
+    """
+    if value:
+      date_time_obj = datetime.strptime(value, from_format)
+      return date_time_obj.strftime(to_format)
+    else:
+      return value
+
+def get_all_s3_keys(s3_path, s3_client):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        #print(resp['KeyCount'])
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].endswith(".json") and not obj['Key'].split('/')[-1].startswith('.'):
+                keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+
+  
+def get_custom_s3_keys(s3_path, s3_client,custom_load_filter):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].split('/')[2].split('/')[0] == custom_load_filter:
+                #print(obj['Key'])
+                if obj['Key'].endswith(".json") and not(obj['Key'].split('/')[-1].startswith('.')):
+                  keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+
+#config.get('source',{}).get('path',{})
+
+
+def create_table_database(logger, db_name, db_location):
+    """
+    Create the database on Hive metastore on the db_location.
+    If the database already exists in the given location, this will be a no-op.
+    Arguments:
+    db_name -- the name of the database to be created
+    db_location -- location in HDFS/S3/DBFS where it needs to be created
+    Throws:
+    Exception if a database with the same name already exists in a different location.
+    """
+    logger.info(f"Creating database {db_name} at '{db_location}'")
+    spark.sql(
+        f"""
+    CREATE DATABASE IF NOT EXISTS {db_name} LOCATION '{db_location}';
+    """
+    )
+    logger.info(f"created database {db_name} at '{db_location}'")
+
+
+def check_is_folder(path):
+    """
+    check provided is a folder or file and append the schema name to path
+    """
+    if path.endswith("/"):
+        return f"{path}"
+    else:
+        return f"{path}/"
+
+def check_table_exist(db_name,table_name):
+    """
+    """
+    try:
+        df=spark.sql(f'SHOW TABLES IN  {db_name} like "{table_name}"')
+        if df.count == 1:
+            return True
+        else:
+            return False
+    except AnalysisException as err:
+        log.error(err)
+        return False
+
+# COMMAND ----------
+
+"""
+output schema of the main driver function that unpacts the input json in small json outputs packets
+"""
+
+prac_info_output_schema = StructType([
+
+StructField('pracEductnInfo',ArrayType(StructType([
+StructField('education_compl',StringType(),True),
+StructField('education_dgree',StringType(),True),
+StructField('education_end_yr',StringType(),True),
+StructField('education_schl_cd',StringType(),True),
+StructField('education_schl_nm',StringType(),True),
+StructField('education_start_yr',StringType(),True),
+StructField('education_ty',StringType(),True),
+StructField('prac_id',LongType(),True)]),True),True),
+
+StructField('pracInfo',ArrayType(StructType([
+StructField('brth_dt',StringType(),True),
+StructField('email_email',StringType(),True), 
+StructField('gender',StringType(),True),
+StructField('ssn', StringType(), True),
+StructField('ssnlast4', StringType(), True),
+StructField('data_src_cd',StringType(),True),
+StructField('prac_id',LongType(),True)]),True),True),
+
+StructField('pracLangInfo',ArrayType(StructType([
+StructField('lang_spoken',StringType(),True),
+StructField('prac_id',LongType(),True)]),True),True),
+
+StructField('pracLocInfo',ArrayType(StructType([
+StructField('prac_id',LongType(),True),
+StructField('addr1',StringType(),True),
+StructField('addr2',StringType(),True),
+StructField('addr_id',StringType(),True),
+StructField('bldg',StringType(),True),
+StructField('city',StringType(),True),
+StructField('country',StringType(),True),
+StructField('dept',StringType(),True),
+StructField('flr',StringType(),True),
+StructField('geolocation_geoaccuracy',StringType(),True),
+StructField('geolocation_latitude',StringType(),True),
+StructField('geolocation_longitude',StringType(),True),
+StructField('pobox',StringType(),True),
+StructField('postal_cd',StringType(),True),
+StructField('reltio_end_dt',StringType(),True),
+StructField('state_provnce',StringType(),True),
+StructField('stdz_flag',StringType(),True),
+StructField('addr_ty',StringType(),True),
+StructField('sub_admin_area',StringType(),True),
+StructField('zip4',StringType(),True),
+StructField('zip5',StringType(),True),
+StructField("phone_area_cd", StringType(), True),
+StructField("phone_num", StringType(), True),
+StructField("is_primary", StringType(), True),
+StructField("addr_ref_rel_reltio_xwalk_src_id", StringType(), True)]),True),True),
+
+StructField('pracNmInfo',ArrayType(StructType([
+StructField('names_frst_nm',StringType(),True),
+StructField('names_lst_nm',StringType(),True),
+StructField('names_mid_nm',StringType(),True),
+StructField('names_nm_ty',StringType(),True),
+StructField('names_sfx_nm',StringType(),True),
+StructField('prac_id',LongType(),True)]),True),True),
+
+StructField('pracPrfsnlInfo',ArrayType(StructType([
+StructField('identifiers_actvtn_dt',StringType(),True),
+StructField('identifiers_exp_dt',StringType(),True),
+StructField('identifiers_state',StringType(),True),
+StructField('prac_id',LongType(),True)]),True),True),
+
+StructField('pracLicnsInfo',ArrayType(StructType([
+StructField('prac_id',LongType(),True),
+StructField('license_num',StringType(),True),
+StructField('license_sts',StringType(),True),
+StructField('license_exp_dt',StringType(),True),
+StructField('license_eff_dt',StringType(),True),
+StructField('license_state',StringType(),True),
+StructField('license_ty',LongType(),True)]),True),True),
+
+StructField('pracIdTyInfo',ArrayType(StructType([
+StructField('identifiers_id',StringType(),True),
+StructField('identifiers_ty',StringType(),True),
+StructField('prac_id',LongType(),True)]),True),True),
+
+StructField('pracSpecltyInfo',ArrayType(StructType([
+StructField('prac_id',LongType(),True),
+StructField('specialities_primary',StringType(),True),
+StructField('specialities_spec_cd',StringType(),True)]),True),True),
+
+StructField('pracSpecltyExpTrainInfo',ArrayType(StructType([
+StructField('prac_id',LongType(),True),
+StructField('gender_idnty_disorder',StringType(),True),
+StructField('hiv_aids',StringType(),True),
+StructField('lgbt_issues',StringType(),True)]),True),True)
+
+])
+
+pracInfo_schema = StructType([
+    StructField('brth_dt', StringType(), True),
+    StructField('email_email', StringType(), True),
+    StructField('gender', StringType(), True),
+    StructField('ssn', StringType(), True),
+    StructField('ssnlast4', StringType(), True),
+    StructField('data_src_cd',StringType(),True),
+    StructField('prac_id', StringType(), True)
+])
+
+pracNmInfo_schema = StructType([
+    StructField('names_frst_nm', StringType(), True),
+    StructField('names_lst_nm', StringType(), True),
+    StructField('names_mid_nm', StringType(), True),
+    StructField('names_nm_ty', StringType(), True),
+    StructField('names_sfx_nm', StringType(), True),
+    StructField('prac_id', StringType(), True)
+])
+
+pracLangInfo_schema = StructType([
+    StructField('lang_spoken', StringType(), True),
+    StructField('prac_id', StringType(), True)
+])
+
+pracPrfsnlInfo_schema = StructType([
+    StructField('identifiers_actvtn_dt', StringType(), True),
+	StructField('identifiers_exp_dt', StringType(), True),
+	StructField('identifiers_state', StringType(), True),
+    StructField('prac_id', StringType(), True)
+])
+
+pracLicnsInfo_schema = StructType([
+    StructField('prac_id', StringType(), True),
+    StructField('license_num', StringType(), True),
+    StructField('license_sts', StringType(), True),
+    StructField('license_exp_dt', StringType(), True),
+	StructField('license_eff_dt' , StringType(), True),
+    StructField('license_state', StringType(), True),
+	StructField('license_ty', StringType(), True)
+])
+
+pracSpecltyInfo_schema = StructType([
+    StructField('prac_id', StringType(), True),
+	StructField('specialities_primary', StringType(), True),
+    StructField('specialities_spec_cd', StringType(), True)
+])
+
+pracEductnInfo_schema = StructType([
+    StructField('education_compl', StringType(), True),
+    StructField('education_dgree', StringType(), True),
+	StructField('education_end_yr', StringType(), True),
+    StructField('education_schl_cd', StringType(), True),
+    StructField('education_schl_nm', StringType(), True),
+	StructField('education_start_yr', StringType(), True),
+	StructField('education_ty', StringType(), True),
+    StructField('prac_id', StringType(), True)
+])
+
+pracIdTyInfo_schema = StructType([
+    StructField('identifiers_id', StringType(), True),
+    StructField('identifiers_ty', StringType(), True),
+	StructField('prac_id', StringType(), True)
+])
+
+pracLocInfo_schema = StructType([
+    StructField('prac_id', StringType(), True),
+    StructField('addr1', StringType(), True),
+    StructField('addr2', StringType(), True),
+	StructField('addr_id', StringType(), True),
+    StructField('bldg', StringType(), True),
+    StructField('city', StringType(), True),
+    StructField('country', StringType(), True),
+    StructField('dept', StringType(), True),
+    StructField('flr', StringType(), True),
+    StructField('geolocation_geoaccuracy', StringType(), True),
+    StructField('geolocation_latitude', StringType(), True),
+    StructField('geolocation_longitude', StringType(), True),
+    StructField('pobox', StringType(), True),
+    StructField('postal_cd', StringType(), True),
+    StructField('reltio_end_dt', StringType(), True),
+    StructField('state_provnce', StringType(), True),
+    StructField('stdz_flag' , StringType(), True),
+    StructField('addr_ty',StringType(),True),
+    StructField('sub_admin_area', StringType(), True),
+    StructField('zip4', StringType(), True),
+    StructField('zip5', StringType(), True),
+    StructField("phone_area_cd", StringType(), True),
+    StructField("phone_num", StringType(), True),
+    StructField("is_primary", StringType(), True),
+    StructField("addr_ref_rel_reltio_xwalk_src_id", StringType(), True)
+])
+
+pracSpecltyExpTrainInfo_schema = StructType([
+    StructField('prac_id', StringType(), True),
+	StructField('gender_idnty_disorder', StringType(), True),
+  	StructField('hiv_aids', StringType(), True),
+    StructField('lgbt_issues', StringType(), True)
+])
+
+recon_output_schema = StructType([
+StructField('pracReconInfo',StructType([
+StructField('file_nm', StringType(), True),
+StructField('batch_cnt', StringType(), True),
+StructField('batch_size', StringType(), True),
+StructField('rcvd_practnr_cnt', LongType(), True),
+StructField('err_practnr_cnt', LongType(), True)]),True)])
+
+# COMMAND ----------
+
+
+def find_curr_dt(load_type, airflow_job_date, source_path,s3_client, custom_load_dates=None):
+    dt = []
+    curr_dt = []
+    if load_type == 'full':
+        # get list of all keys in S3 bucket.
+        all_dates = get_all_s3_keys(source_path, s3_client)
+        for i in range(len(all_dates)):
+            date = all_dates[i].split('/')[1].split('=')[1]
+            dt.append(date)
+        [curr_dt.append(x) for x in dt if x not in curr_dt]
+    elif load_type == 'daily':
+        curr_dt.append(airflow_job_date)
+    elif load_type == 'custom':
+        if custom_load_dates:
+            for i in range(len(custom_load_dates)):
+                dt.append(custom_load_dates[i])
+            [curr_dt.append(x) for x in dt if x not in curr_dt]
+    return curr_dt 
+
+
+# COMMAND ----------
+
+"""
+Function to pick required info from inputs json by spliting the required keys
+"""
+def getPracGenInfo(practnrData, idx):
+    # practnr general info
+    pracInfo = {}
+    if practnrData[idx].get('practitionerInformation') is not None:
+        practnrInfoData = practnrData[idx]['practitionerInformation']
+        pracInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                        if practnrInfoData.get('caqhProviderId') is not None else None)
+        pracInfo['email_email']=(practnrInfoData['primaryEmail'] \
+                        if practnrInfoData.get('primaryEmail') is not None else None)
+        pracInfo['brth_dt']=(practnrInfoData['birthDate'] \
+                        if practnrInfoData.get('birthDate') is not None else None)
+        gender=(practnrInfoData['gender'] \
+                        if practnrInfoData.get('gender') is not None else None)
+        if gender is not None:
+          pracInfo['gender']=(gender[:1])
+        pracInfo['ssn']=(practnrInfoData['ssn'] \
+                        if practnrInfoData.get('ssn') is not None else None)
+        ssnlast4=practnrInfoData['ssn'] \
+                        if practnrInfoData.get('ssn') is not None else None
+        if ssnlast4 is not None:
+          pracInfo['ssnlast4']=(ssnlast4[-4:])
+        else:
+          pracInfo['ssnlast4']=('')
+    return pracInfo
+
+
+def getPracNmInfo(practnrData, idx):
+    # practnr name
+    pracNmInfo = {}
+    practnrInfoData = practnrData[idx]['practitionerInformation']
+    if practnrInfoData.get('firstName') is not None and practnrInfoData['firstName'] != "null" \
+                    or practnrInfoData.get('lastName') is not None and practnrInfoData['lastName'] != "null":
+        pracNmInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                    if practnrInfoData.get('caqhProviderId') is not None else None)
+        pracNmInfo['names_nm_ty']=('LEGAL')
+        pracNmInfo['names_frst_nm']=(practnrInfoData['firstName'] \
+                    if practnrInfoData.get('firstName') is not None else None)
+        pracNmInfo['names_mid_nm']=(practnrInfoData['middleName'] \
+                    if practnrInfoData.get('middleName') is not None else None)
+        pracNmInfo['names_lst_nm']=(practnrInfoData['lastName'] \
+                    if practnrInfoData.get('lastName') is not None else None)
+        pracNmInfo['names_sfx_nm']=(practnrInfoData['suffix'] \
+                    if practnrInfoData.get('suffix') is not None else None)
+    elif practnrInfoData.get('otherNames') is not None and practnrInfoData['otherNames'] != "null":
+        pracOthrNmData =  practnrInfoData['otherNames']
+        for practOtherNmIdx in range(len(pracOthrNmData)):
+            pracNmInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                    if practnrInfoData.get('caqhProviderId') is not None else None)
+            pracNmInfo['names_nm_ty']=('OTHER')
+            pracNmInfo['names_frst_nm']=(pracOthrNmData[practOtherNmIdx]['firstName'] \
+                    if pracOthrNmData[practOtherNmIdx].get('firstName') is not None else None)
+            pracNmInfo['names_mid_nm']=(pracOthrNmData[practOtherNmIdx]['middleName'] \
+                    if pracOthrNmData[practOtherNmIdx].get('middleName') is not None else None)
+            pracNmInfo['names_lst_nm']=(pracOthrNmData[practOtherNmIdx]['lastName'] \
+                    if pracOthrNmData[practOtherNmIdx].get('lastName') is not None else None)
+            pracNmInfo['names_sfx_nm']=(pracOthrNmData[practOtherNmIdx]['suffix'] \
+                    if pracOthrNmData[practOtherNmIdx].get('suffix') is not None else None)
+    else:
+        pracNmInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                    if practnrInfoData.get('caqhProviderId') is not None else None)
+        pracNmInfo['names_nm_ty']=('')
+        pracNmInfo['names_frst_nm']=('')
+        pracNmInfo['names_mid_nm']=('')
+        pracNmInfo['names_lst_nm']=('')
+        pracNmInfo['names_sfx_nm']=('')
+    return pracNmInfo  
+  
+  
+def getPracLangInfo(practnrData, idx):
+    # parctnr lang
+    pracLangInfo = {}
+    practnrInfoData = practnrData[idx]['practitionerInformation']
+    if practnrInfoData.get('languagesSpoken') is not None and practnrInfoData['languagesSpoken'] != "null":
+        pracLangData =  practnrInfoData['languagesSpoken']
+        for practLangIdx in range(len(pracLangData)):
+            pracLangInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                    if practnrInfoData.get('caqhProviderId') is not None else None)
+            pracLangInfo['lang_spoken']=(pracLangData[practLangIdx]['name'] \
+                    if pracLangData[practLangIdx].get('name') is not None else None)
+    else:
+        pracLangInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                    if practnrInfoData.get('caqhProviderId') is not None else None)
+        pracLangInfo['lang_spoken']=('')
+    return pracLangInfo
+
+def getPracPrfsnlInfo(practnrData, idx):
+    # practnr prfsl Dtls
+    pracPrfsnlInfo = {}
+    if practnrData[idx].get('practitionerProfessionalId') is not None:
+        practnrInfoData = practnrData[idx]['practitionerInformation']
+        practnrPrfsnlData = practnrData[idx]['practitionerProfessionalId']
+        practnrCPFData = practnrData[idx]['healthPlanPractitionerDetail']
+        #print(practnrCPFData)
+        for practPrfsnIdx in range(len(practnrPrfsnlData)):
+            if practnrPrfsnlData[practPrfsnIdx].get('practitionerDea') is not None:
+                practnrDeaData = practnrPrfsnlData[practPrfsnIdx]['practitionerDea']
+                for practnrDeaIdx in range(len(practnrDeaData)):
+                    pracPrfsnlInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                      if practnrInfoData.get('caqhProviderId') is not None else None)
+                    pracPrfsnlInfo['identifiers_actvtn_dt']=(practnrDeaData[practnrDeaIdx]['issueDate'] \
+                                if practnrDeaData[practnrDeaIdx].get('issueDate') is not None else None)
+                    pracPrfsnlInfo['identifiers_exp_dt']=(practnrDeaData[practnrDeaIdx]['expirationDate'] \
+                                if practnrDeaData[practnrDeaIdx].get('expirationDate') is not None else None)
+                    pracPrfsnlInfo['identifiers_state']=(practnrDeaData[practnrDeaIdx]['deaState'] \
+                                if practnrDeaData[practnrDeaIdx].get('deaState') is not None else None)
+            pracLicnsInfo = getPracLicnsInfo(practnrPrfsnlData, practPrfsnIdx, practnrInfoData)
+            pracIdInfo = getPracIdInfo(practnrCPFData, practnrPrfsnlData, practPrfsnIdx, practnrInfoData)
+    return pracPrfsnlInfo, pracLicnsInfo, pracIdInfo  
+  
+  
+def getPracLicnsInfo(practnrPrfsnlData, practPrfsnIdx, practnrInfoData):
+    # practnr license
+    pracLicnsInfo = {}
+    if practnrPrfsnlData[practPrfsnIdx].get('practitionerLicense') is not None:
+        practLicnsData = practnrPrfsnlData[practPrfsnIdx].get('practitionerLicense')
+        for practLicnsIdx in range(len(practLicnsData)):
+            pracLicnsInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                    if practnrInfoData.get('caqhProviderId') is not None else None)
+            pracLicnsInfo['license_num']=(practLicnsData[practLicnsIdx]['licenseNumber'] \
+                    if practLicnsData[practLicnsIdx].get('licenseNumber') is not None else None)
+            pracLicnsInfo['license_state']=(practLicnsData[practLicnsIdx]['licenseState'] \
+                    if practLicnsData[practLicnsIdx].get('licenseState') is not None else None)
+            if practLicnsData[practLicnsIdx].get('licenseType') is not None:
+                pracLicnsInfo['license_ty']=(practLicnsData[practLicnsIdx]['licenseType']['name'] \
+                    if practLicnsData[practLicnsIdx]['licenseType'].get('name') is not None else None)
+            else:
+                pracLicnsInfo['license_ty']=('')
+            if practLicnsData[practLicnsIdx].get('licenseStatus') is not None:
+                pracLicnsInfo['license_sts']=(practLicnsData[practLicnsIdx]['licenseStatus']['name'] \
+                    if practLicnsData[practLicnsIdx]['licenseStatus'].get('name') is not None else None)
+            else:
+                pracLicnsInfo['license_sts']=('')
+            pracLicnsInfo['license_exp_dt']=(practLicnsData[practLicnsIdx]['expirationDate'] \
+                    if practLicnsData[practLicnsIdx].get('expirationDate') is not None else None)
+            pracLicnsInfo['license_eff_dt']=(practLicnsData[practLicnsIdx]['issueDate'] \
+                    if practLicnsData[practLicnsIdx].get('issueDate') is not None else None)
+    return pracLicnsInfo
+
+def getPracIdInfo(practnrCPFData, practnrPrfsnlData, practPrfsnIdx, practnrInfoData):
+    # practnr Id Type
+    pracIdTyInfo = {}
+    if practnrCPFData.get('proViewRosterPractitionerID') is not None:
+        pracIdTyInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                  if practnrInfoData.get('caqhProviderId') is not None else None)
+        pracIdTyInfo['identifiers_ty']=('CPF ID')
+        pracIdTyInfo['identifiers_id']=(practnrCPFData['proViewRosterPractitionerID'])
+    else:
+      if practnrPrfsnlData[practPrfsnIdx].get('practitionerNpi') is not None \
+                  and practnrPrfsnlData[practPrfsnIdx]['practitionerNpi'].get('npiNumber') is not None:
+        pracIdTyInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                  if practnrInfoData.get('caqhProviderId') is not None else None)
+        pracIdTyInfo['identifiers_ty']=('NPI')
+        pracIdTyInfo['identifiers_id']=(practnrPrfsnlData[practPrfsnIdx]['practitionerNpi']['npiNumber'])
+      elif practnrPrfsnlData[practPrfsnIdx].get('practitionerDea') is not None:
+        practnrDeaData = practnrPrfsnlData[practPrfsnIdx]['practitionerDea']
+        for practnrDeaIdx in range(len(practnrDeaData)):
+            pracIdTyInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                  if practnrInfoData.get('caqhProviderId') is not None else None)
+            pracIdTyInfo['identifiers_ty']=('DEA')
+            pracIdTyInfo['identifiers_id']=(practnrDeaData[practnrDeaIdx]['deaNumber'] \
+                  if practnrDeaData[practnrDeaIdx].get('deaNumber') is not None else None)
+      else:
+        pracIdTyInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                  if practnrInfoData.get('caqhProviderId') is not None else None)
+        pracIdTyInfo['identifiers_ty']=('')
+        pracIdTyInfo['identifiers_id']=('')
+
+    return pracIdTyInfo
+
+def getPracSpecltyInfo(practnrData, idx):
+    # practnr speclty
+    pracSpecltyInfo = {}
+    if practnrData[idx].get('practitionerSpecialty') is not None:
+        practnrInfoData = practnrData[idx]['practitionerInformation']
+        practnrSpecltyData = practnrData[idx]['practitionerSpecialty']
+        for practSpecltyIdx in range(len(practnrSpecltyData)):
+            if practnrSpecltyData[practSpecltyIdx].get('primarySpecialty') is not None:
+                practnrPrimSpecltyData = practnrSpecltyData[practSpecltyIdx]['primarySpecialty']
+                pracSpecltyInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                          if practnrInfoData.get('caqhProviderId') is not None else None)
+                if practnrPrimSpecltyData.get('specialtyName') is not None:
+                    pracSpecltyInfo['specialities_spec_cd']=(practnrPrimSpecltyData['specialtyName']['name'] \
+                          if practnrPrimSpecltyData['specialtyName'].get('name') is not None else None)
+                else:
+                    pracSpecltyInfo['specialities_spec_cd']=('')
+                pracSpecltyInfo['specialities_primary']=(practnrPrimSpecltyData['primarySpecialtyFlag'] \
+                          if practnrPrimSpecltyData.get('primarySpecialtyFlag') is not None else None)
+    return pracSpecltyInfo
+  
+def getPracEductnInfo(practnrData, idx):
+    # practnr education
+    pracEductnInfo = {}
+    if practnrData[idx].get('practitionerEducation') is not None:
+        practnrInfoData = practnrData[idx]['practitionerInformation']
+        practnrEductnData = practnrData[idx]['practitionerEducation']
+        for practEductnIdx in range(len(practnrEductnData)):
+            if practnrEductnData[practEductnIdx].get('practitionerProfessionalSchool') is not None:
+                practnrPrfsnlSchlData = practnrEductnData[practEductnIdx]['practitionerProfessionalSchool']
+                for practnrPrfsnlSchlIdx in range(len(practnrPrfsnlSchlData)):
+                    pracEductnInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                                if practnrInfoData.get('caqhProviderId') is not None else None)
+                    if practnrPrfsnlSchlData[practnrPrfsnlSchlIdx].get('institutionName') is not None:
+                        practnrInsttnData = practnrPrfsnlSchlData[practnrPrfsnlSchlIdx]['institutionName']
+                        pracEductnInfo['education_schl_cd']=(practnrInsttnData['id'] \
+                                if practnrInsttnData.get('id') is not None else None)
+                        pracEductnInfo['education_schl_nm']=(practnrInsttnData['name'] \
+                                if practnrInsttnData.get('name') is not None else None)
+                    else:
+                        pracEductnInfo['education_schl_cd']=('')
+                        pracEductnInfo['education_schl_nm']=('')
+                    pracEductnInfo['education_ty']=(None)
+                    pracEductnInfo['education_compl']=(practnrPrfsnlSchlData[practnrPrfsnlSchlIdx]['completionFlag'] \
+                                if practnrPrfsnlSchlData[practnrPrfsnlSchlIdx].get('completionFlag') is not None else None)
+                    if practnrPrfsnlSchlData[practnrPrfsnlSchlIdx].get('degree') is not None:
+                        pracEductnInfo['education_dgree']=(practnrPrfsnlSchlData[practnrPrfsnlSchlIdx]['degree']['name'] \
+                                if practnrPrfsnlSchlData[practnrPrfsnlSchlIdx]['degree'].get('name') is not None else None)
+                    else:
+                        pracEductnInfo['education_dgree']=('')
+                    pracEductnInfo['education_start_yr']=(practnrPrfsnlSchlData[practnrPrfsnlSchlIdx]['startDate'] \
+                                if practnrPrfsnlSchlData[practnrPrfsnlSchlIdx].get('startDate') is not None else None)
+                    pracEductnInfo['education_end_yr']=(practnrPrfsnlSchlData[practnrPrfsnlSchlIdx]['endDate'] \
+                                if practnrPrfsnlSchlData[practnrPrfsnlSchlIdx].get('endDate') is not None else None)
+    return pracEductnInfo
+
+def getPracLocInfo(practnrData, idx):
+    # practnr loc
+    pracLocInfo = {}
+    if practnrData[idx].get('practitionerPracticeLocation') is not None:
+        practnrInfoData = practnrData[idx].get('practitionerInformation')
+        practnrPractLocData = practnrData[idx].get('practitionerPracticeLocation')
+        for practLocIdx in range(len(practnrPractLocData)):
+            if practnrPractLocData[practLocIdx].get('activeLocation') is not None:
+                practActvLocData = practnrPractLocData[practLocIdx].get('activeLocation')
+                for actvLocIdx in range(len(practActvLocData)):
+                    pracLocInfo['postal_cd']=('')
+                    pracLocInfo['dept']=('')
+                    pracLocInfo['geolocation_latitude']=('')
+                    pracLocInfo['geolocation_longitude']=('')
+                    pracLocInfo['geolocation_geoaccuracy']=('')
+                    pracLocInfo['flr']=('')
+                    pracLocInfo['bldg']=('')
+                    pracLocInfo['pobox']=('')
+                    pracLocInfo['stdz_flag']=('')
+                    pracLocInfo['reltio_end_dt']=('')
+                    if practActvLocData[actvLocIdx].get('officeType') is not None:
+                        ofcTypeNm = practActvLocData[actvLocIdx]['officeType']['name'] \
+                                if practActvLocData[actvLocIdx]['officeType'].get('name') is not None else None
+                        if ofcTypeNm == 'Primary Practice':
+                          pracLocInfo['is_primary']=('true')
+                        elif ofcTypeNm == 'Other Practice':  
+                          pracLocInfo['is_primary']=('false')
+                    else:
+                        ofcTypeNm = None
+                        pracLocInfo['is_primary']=('')
+                    if practActvLocData[actvLocIdx].get('address') is not None:
+                        country = practActvLocData[actvLocIdx]['address']['country'] \
+                                if practActvLocData[actvLocIdx]['address'].get('country') is not None else None
+                        if ofcTypeNm in ('Primary Practice', 'Other Practice') and country == 'UNITED_STATES':
+                            pracLocInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                                if practnrInfoData.get('caqhProviderId') is not None else None)
+                            pracLocInfo['addr1']=(practActvLocData[actvLocIdx]['address']['address1'] \
+                                if practActvLocData[actvLocIdx]['address'].get('address1') is not None else None)
+                            pracLocInfo['addr2']=(practActvLocData[actvLocIdx]['address']['address2'] \
+                                if practActvLocData[actvLocIdx]['address'].get('address2') is not None else None)
+                            pracLocInfo['city']=(practActvLocData[actvLocIdx]['address']['city'] \
+                                if practActvLocData[actvLocIdx]['address'].get('city') is not None else None)
+                            pracLocInfo['state_provnce']=(practActvLocData[actvLocIdx]['address']['state'] \
+                                if practActvLocData[actvLocIdx]['address'].get('state') is not None else None)
+                            pracLocInfo['country']=(country)
+                            zip_cd = practActvLocData[actvLocIdx]['address']['zipCode'] \
+                                if practActvLocData[actvLocIdx]['address'].get('zipCode') is not None else None
+                            if zip_cd is not None:
+                                pracLocInfo['zip4']=(zip_cd[-4:])
+                                pracLocInfo['zip5']=(zip_cd[:5])
+                            else:
+                                pracLocInfo['zip4']=('')
+                                pracLocInfo['zip5']=('')
+                            pracLocInfo['sub_admin_area']=(practActvLocData[actvLocIdx]['practiceLocationCounty'] \
+                                if practActvLocData[actvLocIdx].get('practiceLocationCounty') is not None else None)
+                            phone_number = practActvLocData[actvLocIdx]['phoneNumber'] \
+                                if practActvLocData[actvLocIdx].get('phoneNumber') is not None else None
+                            if phone_number is not None:
+                                pracLocInfo['phone_area_cd']=(phone_number[:3])
+                                pracLocInfo['phone_num']=(phone_number[-7:])
+                            else:
+                                pracLocInfo['phone_area_cd']=('')
+                                pracLocInfo['phone_num']=('')
+                            pracLocInfo['addr_ref_rel_reltio_xwalk_src_id']=(practActvLocData[actvLocIdx]['caqhLocationId'] \
+                                if practActvLocData[actvLocIdx].get('caqhLocationId') is not None else None)
+                            pracLocInfo['addr_id']=(practActvLocData[actvLocIdx]['caqhLocationId'] \
+                                if practActvLocData[actvLocIdx].get('caqhLocationId') is not None else None)
+                        else:
+                            pracLocInfo['prac_id']=practnrInfoData['caqhProviderId']
+                            pracLocInfo['addr1']=('')
+                            pracLocInfo['addr2']=('')
+                            pracLocInfo['city']=('')
+                            pracLocInfo['state_provnce']=('')
+                            pracLocInfo['country']=('')
+                            pracLocInfo['zip4']=('')
+                            pracLocInfo['zip5']=('')
+                            pracLocInfo['sub_admin_area']=('')
+                            pracLocInfo['phone_area_cd']=('')
+                            pracLocInfo['phone_num']=('')
+                            pracLocInfo['addr_ref_rel_reltio_xwalk_src_id']=('')
+                            pracLocInfo['addr_id']=('')
+                    else:
+                        pracLocInfo['prac_id']=practnrInfoData['caqhProviderId']
+                        pracLocInfo['addr1']=('')
+                        pracLocInfo['addr2']=('')
+                        pracLocInfo['city']=('')
+                        pracLocInfo['state_provnce']=('')
+                        pracLocInfo['country']=('')
+                        pracLocInfo['zip4']=('')
+                        pracLocInfo['zip5']=('')
+                        pracLocInfo['sub_admin_area']=('')
+                        pracLocInfo['phone_area_cd']=('')
+                        pracLocInfo['phone_num']=('')
+                        pracLocInfo['addr_ref_rel_reltio_xwalk_src_id']=('')
+                        pracLocInfo['addr_id']=('')
+    return pracLocInfo
+
+def getPracSpecltyExpTrInfo(practnrData, idx):
+    # practnr general info
+    pracSpecltyExpTrainInfo = {}
+    if practnrData[idx].get('practitionerSpecialExperienceAndTraining') is not None:
+        practnrInfoData = practnrData[idx]['practitionerInformation']
+        practnrSpecltyExpTrData = practnrData[idx]['practitionerSpecialExperienceAndTraining']
+        pracSpecltyExpTrainInfo['prac_id']=(practnrInfoData['caqhProviderId'] \
+                        if practnrInfoData.get('caqhProviderId') is not None else None)
+        gender_idnty_disorder=(practnrSpecltyExpTrData['genderIdentityDisorder'] \
+                        if practnrSpecltyExpTrData.get('genderIdentityDisorder') is not None else None)
+        if gender_idnty_disorder is not None:
+          if gender_idnty_disorder == 'true':
+            pracSpecltyExpTrainInfo['gender_idnty_disorder']=('Y')
+          elif gender_idnty_disorder == 'false':
+            pracSpecltyExpTrainInfo['gender_idnty_disorder']=('N')
+          elif gender_idnty_disorder == 'null':
+            pracSpecltyExpTrainInfo['gender_idnty_disorder']=('NULL')
+        else:
+          pracSpecltyExpTrainInfo['gender_idnty_disorder']=('')
+        hiv_aids=(practnrSpecltyExpTrData['hivAIDS'] \
+                        if practnrSpecltyExpTrData.get('hivAIDS') is not None else None)
+        if hiv_aids is not None:
+          if hiv_aids == 'true':
+            pracSpecltyExpTrainInfo['hiv_aids']=('Y')
+          elif hiv_aids == 'false':
+            pracSpecltyExpTrainInfo['hiv_aids']=('N')
+          elif hiv_aids == 'null':
+            pracSpecltyExpTrainInfo['hiv_aids']=('NULL')
+        else:
+          pracSpecltyExpTrainInfo['hiv_aids']=('')
+        lgbt_issues=(practnrSpecltyExpTrData['lesbianGayBisexualTransgenderLGBTIssues'] \
+                        if practnrSpecltyExpTrData.get('lesbianGayBisexualTransgenderLGBTIssues') is not None else None)
+        if lgbt_issues is not None:
+          if lgbt_issues == 'true':
+            pracSpecltyExpTrainInfo['lgbt_issues']=('Y')
+          elif lgbt_issues == 'false':
+            pracSpecltyExpTrainInfo['lgbt_issues']=('N')
+          elif lgbt_issues == 'null':
+            pracSpecltyExpTrainInfo['lgbt_issues']=('NULL')
+        else:
+          pracSpecltyExpTrainInfo['lgbt_issues']=('')
+
+    return pracSpecltyExpTrainInfo  
+
+def getMetricInfo(reconData):
+    #recon metadata from input json
+    pracReconInfo = {}
+    if reconData is not None:
+        pracReconInfo['file_nm']=(reconData['extractFileName'][0] \
+                        if reconData.get('extractFileName') is not None else None)
+        pracReconInfo['batch_cnt']=(reconData['extractBatchCount'] \
+                        if reconData.get('extractBatchCount') is not None else None)
+        pracReconInfo['batch_size']=(reconData['extractBatchSize'] \
+                        if reconData.get('extractBatchSize') is not None else None)
+        pracReconInfo['rcvd_practnr_cnt']=(reconData['extractDeliveredPractitionerCount'] \
+                        if reconData.get('extractDeliveredPractitionerCount') is not None else None)
+        pracReconInfo['err_practnr_cnt']=(reconData['extractErroredPractitionerCount'] \
+                        if reconData.get('extractErroredPractitionerCount') is not None else None)
+    return pracReconInfo
+
+#config = download_yaml_from_s3(config_location)
+# curr_dt='2021-03-01'
+# s3_client = boto3.client('s3')
+# bucket= 'da-datastore-provider.dev-cignasplithorizon'
+
+def getPracInfo_format(r):
+    row = r.asDict(recursive=True)
+    PracGenInfo=[]
+    PracNmInfo=[]
+    PracLangInfo=[]
+    PracPrfsnlInfo=[]
+    PracLicnsInfo = []
+    PracIdTyInfo = []
+    PracSpecltyInfo=[]
+    PracEductnInfo=[]
+    PracLocInfo=[]
+    PracSpecltyExpTrainInfo=[]
+#    if row.get('data') is not None:
+#        if row['data'].get('getPractitioners') is not None:
+    practnrData = row['getPractitioners']
+    for idx in range(len(practnrData)):
+        PracGenInfo.append(getPracGenInfo(practnrData, idx))
+        PracNmInfo.append(getPracNmInfo(practnrData, idx))
+        PracLangInfo.append(getPracLangInfo(practnrData, idx))
+        pracPrfsnlInfo, pracLicnsInfo, pracIdTyInfo = getPracPrfsnlInfo(practnrData, idx)
+        PracPrfsnlInfo.append(pracPrfsnlInfo)
+        PracLicnsInfo.append(pracLicnsInfo)
+        PracIdTyInfo.append(pracIdTyInfo)
+        PracSpecltyInfo.append(getPracSpecltyInfo(practnrData, idx))
+        PracEductnInfo.append(getPracEductnInfo(practnrData, idx))
+        PracLocInfo.append(getPracLocInfo(practnrData, idx))
+        PracSpecltyExpTrainInfo.append(getPracSpecltyExpTrInfo(practnrData, idx))        
+    return {'pracInfo':PracGenInfo, 'pracNmInfo':PracNmInfo, 'pracLangInfo':PracLangInfo, 'pracPrfsnlInfo':PracPrfsnlInfo, 'pracLicnsInfo':PracLicnsInfo,'pracIdTyInfo':PracIdTyInfo, 'pracSpecltyInfo':PracSpecltyInfo, 'pracEductnInfo':PracEductnInfo, 'pracLocInfo':PracLocInfo, 'pracSpecltyExpTrainInfo':PracSpecltyExpTrainInfo}
+  
+  
+def recon_data_format(r):
+    """
+    read input json into dataframe and call udf functions to parse the recon metadata by looking up the keys in the json
+    """
+    row = r.asDict(recursive=True)
+    pracReconInfo = []
+    Metricdata = row['getExtractMetadataByJobID']
+    pracReconInfo.append(getMetricInfo(Metricdata))
+    return pracReconInfo
+  
+  
+
+
+# COMMAND ----------
+#################DQ DEVELOPMENT MODULE#################
+
+def pandas_to_spark(pandas_df):
+    columns = list(pandas_df.columns)
+    types = list(pandas_df.dtypes)
+    struct_list = []
+    for column, typo in zip(columns, types):
+        struct_list.append(define_structure(column, typo))
+    p_schema = StructType(struct_list)
+    return spark.createDataFrame(pandas_df, p_schema)
+
+
+def apply_dq(df, config,name,logger):
+    domain = config['domain']
+    dq_rule = config.get('dq', {}).get('rule')
+    print("APPLY_DQ_FUNC_CALLED")
+    if dq_rule=='yes': #if dq_rule is not None and len(dq_rule) > 0:   CAQH_STAGING.RELTIO_HCP
+        # Retrieve the Rules content from rules URI
+        rules_hcp = {'DQ_REPORT_EXTRA_COLUMNS': [{'CAQH_STAGING.RELTIO_HCP': ['prac_id', 'names_frst_nm', 'names_lst_nm']}], 'DQ_RULES': [{'name': 'prac_id', 'business_term': 'Practitioner Unique Identifier', 'label': 'Must be populated', 'rule_identity': 'prac_id_Completeness_1', 'rule_type': 'Completeness', 'regex': False, 'old_rule': 'None', 'source': 'CAQH_STAGING.RELTIO_HCP.prac_id', 'new_rule': 'populated', 'rule_condition': 'None', 'critical_data_element': True, 'post_dq_action': 'Drop Record', 'pre_dq': False, 'pre_dq_rule': 'None'}, {'name': 'prac_id', 'business_term': 'Practitioner Unique Identifier', 'label': 'Format is numeric', 'rule_identity': 'prac_id_Conformity_1', 'rule_type': 'Conformity', 'regex': False, 'old_rule': 'None', 'source': 'CAQH_STAGING.RELTIO_HCP.prac_id', 'new_rule': 'is_numeric', 'rule_condition': 'None', 'critical_data_element': True, 'post_dq_action': 'Pass Thru but log if failure', 'pre_dq': False, 'pre_dq_rule': 'None'}, {'name': 'names_frst_nm', 'business_term': 'Practitioner First Name', 'label': 'Must be populated', 'rule_identity': 'Practitioner_Firstname_Completeness_1', 'rule_type': 'Completeness', 'regex': False, 'old_rule': 'None', 'source': 'CAQH_STAGING.RELTIO_HCP.names_frst_nm', 'new_rule': 'populated', 'rule_condition': 'None', 'critical_data_element': True, 'post_dq_action': 'Pass Thru but log if failure', 'pre_dq': True, 'pre_dq_rule': 'remove_non_ascii_chars'}, {'name': 'names_lst_nm', 'business_term': 'Practitioner Last Name', 'label': 'Must be populated', 'rule_identity': 'Practitioner_Lastname_Completeness_1', 'rule_type': 'Completeness', 'regex': False, 'old_rule': 'None', 'source': 'CAQH_STAGING.RELTIO_HCP.names_lst_nm', 'new_rule': 'populated', 'rule_condition': 'None', 'critical_data_element': True, 'post_dq_action': 'Pass Thru but log if failure', 'pre_dq': True, 'pre_dq_rule': 'remove_non_ascii_chars'}]}
+        rules_loc = {'DQ_REPORT_EXTRA_COLUMNS': [{'CAQH_STAGING.RELTIO_LOC': ['addr_id', 'addr1']}], 'DQ_RULES': [{'name': 'addr_id', 'business_term': 'Active Primary Location Identifier', 'label': 
+'Must be populated', 'rule_identity': 'addr_id_Completeness_1', 'rule_type': 'Completeness', 'regex': False, 'old_rule': 'None', 'source': 'CAQH_STAGING.RELTIO_LOC.addr_id', 'new_rule': 'populated', 'rule_condition': 'None', 'critical_data_element': True, 'post_dq_action': 'Drop Record', 'pre_dq': False, 'pre_dq_rule': 'None'}, {'name': 'addr_id', 'business_term': 'Active Primary Location Identifier', 'label': 'Format is alphanumeric; Can include only certain special characters', 'rule_identity': 'addr_id_Conformity_1', 'rule_type': 'Conformity', 'regex': True, 'old_rule': 'None', 'source': 'CAQH_STAGING.RELTIO_LOC.addr_id','new_rule': "^[A-Za-z0-9()&\\-,;. \\/\\+\\*'@\\\\:\\`#=!\\$]*$", 'rule_condition': 'None', 'critical_data_element': True, 'post_dq_action': 'Pass Thru but log if failure', 'pre_dq': False, 'pre_dq_rule': 'None'}, {'name': 'addr1', 'business_term': 'Active Primary Location Address', 'label': 'Must be populated', 'rule_identity': 'addr1_Completeness_1', 'rule_type': 'Completeness', 'regex': False, 'old_rule': 'None', 'source': 'CAQH_STAGING.RELTIO_LOC.addr1', 'new_rule': 'populated', 'rule_condition': 'None', 'critical_data_element': True, 'post_dq_action': 'Drop Record', 'pre_dq': False, 'pre_dq_rule': 'None'}]}
+      
+        # Enable Arrow-based columnar data transfers
+        spark.conf.set("spark.sql.execution.arrow.enabled", "true")
+        spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+
+        # params for constructing DataQualityProcessor
+        entity = f"{config['target']['table_schema']}.{config['target']['table_name']}".upper()
+        print(entity)
+        if name=='hcp':
+          rules=rules_hcp
+        elif name=='loc':
+          rules=rules_loc
+        print(name)
+        
+        
+        pandas_df = df.select("*").toPandas()
+
+        result_df_pandas = process_data_quality(
+            pandas_df, entity, rules, domain, config['name'], logger)
+
+        dq_dead_letter_queue = config['dq']['dlq']
+        if dq_dead_letter_queue is not None or dq_dead_letter_queue.startswith("s3://"):
+            # Write errors to S3 location as dead-letter queue or reporting purpose
+            # disable the transaction logs of spark write using
+            spark.conf.set("spark.sql.sources.commitProtocolClass",
+                           "org.apache.spark.sql.execution.datasources.SQLHadoopMapReduceCommitProtocol")
+            # disable the _SUCCESS file
+            spark.conf.set(
+                "mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
+            (pandas_to_spark(result_df_pandas.exptn_df)
+             .write
+             .format("json")
+             .mode("append")
+             .save(dq_dead_letter_queue)
+             )
+
+        return pandas_to_spark(result_df_pandas.df)
+    else:
+        # No DQ Rules supplied. Returning Dataframe as-is.
+        return df
+      
+      
+#         dq_columns_list = rules_loc['DQ_REPORT_EXTRA_COLUMNS']
+#         dq_columns_list1 = {k: v for element in dq_columns_list for k,v in element.items()}
+#         print("#######################dq_columns_list########################")
+#         print(dq_columns_list1)
+#         EXTRA_DQ_COLUMN = dq_columns_list1[entity]
+#         print("#######################EXTRA_DQ_COLUMN########################")
+#         print(EXTRA_DQ_COLUMN)
+ 
+  
+
+def process_data_quality(df, entity, rules, domain, name,logger):
+    try:
+        if df is None:
+            print(f'Domain: {domain}. DQ Failed: Empty DataFrame was provided to be processed. Table -> {entity}')
+            logger.error(f'Domain: {domain}. DQ Failed: Empty DataFrame was provided to be processed. Table -> {entity}')
+            return df
+        else:
+            # Processing the Data
+            dq = None
+            data_process = DataQualityProcessor(df, entity, rules, domain)
+            #data_process.set_logger(logger)
+            dq = data_process.process_dq_exception()
+
+            if dq is None:
+                logger.error(f'Domain: {domain}. DQ Failed: Invalid Input. Table -> {entity}')
+                return df
+            else:
+                log_dq(dq, domain, name)
+                return dq
+     # Catch all other exceptions
+    except (AttributeError, ValueError, RuntimeError, TypeError, NameError, Exception) as e:
+        logger.error(f'Domain: {domain}. DQ Failure: Table -> {entity}, Error Message -> {e}')
+        raise RuntimeError(f"Domain: {domain}. DQ Failed with Exception " + str(e))
+
+
+def log_dq(dq, domain, name):
+    if type(dq.dict_list) == defaultdict:
+        # Output Records to Cloud Watch for Pre-DQ Cleansing Report
+        for key, value_list in dq.dict_list.items():
+            if (len(value_list) > 2):
+                logger.info(f"Domain: {domain}. PRE_DQ_CLEANSING = " + json.dumps(value_list))
+
+    if not dq.exptn_df.empty:
+        # Convert Exception DataFrame Records to Json
+        dict_exptn_records = json.loads(dq.exptn_df.to_json(orient="records"))
+        # Output Records to Cloud Watch for DQ Exception Report
+        for dq_exptn in dict_exptn_records:
+            logger.warning(f"Domain: {domain}. DQ_EXCEPTION = [" + json.dumps(dq_exptn) + "]")
+
+
+logging.getLogger("py4j").setLevel(logging.WARNING)
+
+write_mode='overwrite'
+def writeHcpToS3(curr_dt, prac_df, prac_nm_df, prac_lang_df, prac_prfsnl_df, prac_licns_df, prac_speclty_df, prac_eductn_df, prac_idty_df, prac_speclty_exptr_df,config):
+    """
+    join incoming practioner related dataframes into reltio_hcp snapshot table
+    """
+    hcp_df = prac_df.join(prac_nm_df, how='left', on='prac_id').join(prac_lang_df, how='left', on='prac_id'). \
+        join(prac_prfsnl_df, how='left', on='prac_id').join(prac_licns_df, how='left', on='prac_id'). \
+        join(prac_speclty_df, how='left', on='prac_id').join(prac_eductn_df, how='left', on='prac_id'). \
+        join(prac_idty_df, how='left', on='prac_id').join(prac_speclty_exptr_df, how='left', on='prac_id')
+
+    hcp_df = hcp_df.drop_duplicates()
+    hcp_df = hcp_df.withColumn('ingstn_dt', lit(curr_dt))
+    hcp_df = hcp_df.withColumn('data_src_cd', lit('CAQH'))
+    hcp_df=hcp_df.withColumn('addr_ty', lit('SERVICE'))
+    null_cols = ['email_ty','email_validtn_sts','identifiers_sts', 'identifiers_issuer', 'identifiers_deactvtn_rsn_cd', 'identifiers_deactvtn_dt', \
+                    'identifiers_reactvtn_dt', 'identifiers_create_dt', 'identifiers_lst_upd_dt', 'reltio_end_dt','active_ind','phone_ty', \
+                    'stop_usage_indicator', 'prof_ty', 'website_url']
+    for null_col in null_cols:
+        hcp_df=hcp_df.withColumn(null_col, lit('NULL'))
+
+    dt_cols = ['brth_dt', 'identifiers_actvtn_dt', 'identifiers_exp_dt', 'license_exp_dt', 'license_eff_dt', 'education_start_yr', \
+                'education_end_yr']
+    for dt_col in dt_cols:
+      hcp_df = hcp_df.withColumn(dt_col, time_format_convert(col(dt_col).cast('string'), lit('%Y-%m-%dT%H:%M:%S%z'), lit('%Y-%m-%d')))
+
+    hcp_df = hcp_df.select('prac_id','data_src_cd','names_nm_ty','names_frst_nm','names_mid_nm','names_lst_nm','names_sfx_nm','email_ty','email_email', \
+                        'email_validtn_sts','prof_ty','website_url','gender','brth_dt','lang_spoken','identifiers_ty','identifiers_id','identifiers_sts', \
+                        'identifiers_actvtn_dt','identifiers_exp_dt','identifiers_state','identifiers_issuer','identifiers_deactvtn_rsn_cd', \
+                        'identifiers_deactvtn_dt','identifiers_reactvtn_dt','identifiers_create_dt','identifiers_lst_upd_dt','specialities_spec_cd', \
+                        'specialities_primary','license_num','license_state','license_ty','license_sts','license_exp_dt','license_eff_dt','education_schl_cd', \
+                        'education_schl_nm','education_ty','education_compl','education_dgree','education_start_yr','education_end_yr','ssn','ssnlast4','lgbt_issues','gender_idnty_disorder','hiv_aids', \
+                        'reltio_end_dt','active_ind','stop_usage_indicator','ingstn_dt')
+    hcp_df = hcp_df.fillna("")
+    hcp_df = hcp_df.replace("",'NULL')
+    #hcp_df.printSchema()
+    #hcp_df = apply_dq(hcp_df,config,"hcp",logging)
+    display(hcp_df)
+    
+    table_name= config.get('target',{}).get('table_name',{})
+    table_schema = config.get('target',{}).get('table_schema',{})
+    table_path= config.get('target',{}).get('table_location',{})
+    table_location= table_path +table_name+ "/"
+    partition= config.get('target',{}).get('partition_columns',{})
+    table_format= config.get('target',{}).get('table_format',{})
+    target_table_name = f"{table_schema}.{table_name}"
+
+    create_table_database(logging,table_schema,check_is_folder(table_location))
+    if not check_table_exist(table_schema, table_name):
+      hcp_df.write.option("path", table_location).option("overwriteSchema","true").partitionBy(partition).format("delta").mode(write_mode).saveAsTable(target_table_name)
+     
+    
+def writeLocToS3(curr_dt, prac_df, prac_loc_df, config):
+    """
+    join incoming practioner related dataframes into reltio_location snapshot table
+    """
+    loc_df = prac_df.join(prac_loc_df, on='prac_id')
+    loc_df = loc_df.drop_duplicates()
+    loc_df = loc_df.withColumn('data_src_cd', lit('CAQH'))
+    loc_df = loc_df.withColumn('ingstn_dt', lit(curr_dt))
+    null_cols = ['reltio_end_dt','active_ind','phone_ty','stop_usage_indicator']
+    for null_col in null_cols:
+        loc_df=loc_df.withColumn(null_col, lit('NULL'))
+        
+    loc_df = loc_df.select('data_src_cd','prac_id','addr_id','addr1','addr2','city','state_provnce','country','postal_cd','zip4','zip5','sub_admin_area', \
+                           'dept','geolocation_latitude','geolocation_longitude','geolocation_geoaccuracy','flr','bldg','pobox','stdz_flag','addr_ty', \
+                           'phone_ty','phone_area_cd','phone_num','is_primary','addr_ref_rel_reltio_xwalk_src_id','reltio_end_dt','active_ind','stop_usage_indicator','ingstn_dt')
+    #loc_df = loc_df.na.drop(subset=['addr1','addr2','city','state_provnce','country','zip4','zip5','sub_admin_area'], how='all')
+    loc_df = loc_df.na.fill("")
+    loc_df = loc_df.replace("",'NULL')
+    loc_df = loc_df.filter(col("addr1").isNotNull()).filter("addr1 != ''")
+    
+    #loc_df = apply_dq(loc_df, config, "loc",logging)
+    display(loc_df)
+    
+    table_name= config.get('target',{}).get('table_name',{})
+    table_schema = config.get('target',{}).get('table_schema',{})
+    table_path= config.get('target',{}).get('table_location',{})
+    table_location= table_path +table_name+ "/"
+    partition= config.get('target',{}).get('partition_columns',{})
+    table_format= config.get('target',{}).get('table_format',{})
+    target_table_name = f"{table_schema}.{table_name}"
+
+    create_table_database(logging,table_schema,check_is_folder(table_location))
+    if not check_table_exist(table_schema, table_name):
+      loc_df.write.option("path", table_location).option("overwriteSchema","true").partitionBy(partition).format("delta").mode(write_mode).saveAsTable(target_table_name)
+    
+def writeReconToS3(curr_dt,df_recon_info,config):
+    try:
+        recon_df = df_recon_info
+        recon_df = recon_df.drop_duplicates()
+        recon_df = recon_df.withColumn('ingstn_dt', lit(curr_dt))
+        records_loaded_count=spark.sql("select count(*) as delta_loaded_count from caqh_staging.reltio_hcpp where ingstn_dt = '{}'".format(curr_dt))
+        #print(records_loaded_count)
+        recon_df = recon_df.join(records_loaded_count)
+        recon_df = recon_df.select('file_nm','batch_cnt','each_batch_size','delta_loaded_count','src_rcvd_practnr_cnt','src_err_practnr_cnt','ingstn_dt')
+        recon_df = recon_df.fillna("")
+        recon_df = recon_df.replace("",'NULL')
+        #logging.info("recon df : {0}".format(recon_df))
+        display(recon_df)
+        #recon_df.printSchema()
+        
+        table_name= config.get('target',{}).get('table_name',{})
+        table_schema = config.get('target',{}).get('table_schema',{})
+        table_path= config.get('target',{}).get('table_location',{})
+        table_location= table_path +table_name+ "/"
+        partition= config.get('target',{}).get('partition_columns',{})
+        table_format= config.get('target',{}).get('table_format',{})
+        target_table_name = f"{table_schema}.{table_name}"
+        
+        create_table_database(logging,table_schema,check_is_folder(table_location))
+        if not check_table_exist(table_schema, table_name):
+            recon_df.write.option("path",table_location).option("overwriteSchema","true").partitionBy(partition).format("delta").mode(write_mode).saveAsTable(target_table_name)
+
+    except Exception as e:
+        logging.error("failed to load recon data from df to s3 bucket with error {0}" \
+                        .format(traceback.format_exc()))
+        return 1
+
+def writeRelationToS3(curr_dt,prac_df,prac_loc_df, config):
+    """
+    join incoming relatiomn related dataframes into reltio_location snapshot table
+    """
+    relation_df=prac_df.join(prac_loc_df, how='inner', on='prac_id')
+    relation_df = relation_df.withColumn('data_src_cd', lit('CAQH'))
+    relation_df = relation_df.withColumn("ingstn_dt", lit(curr_dt))
+#     relation_df = relation_df.withColumn('start_obj_id', lit(p))
+#     relation_df = relation_df.withColumn('end_obj_id', lit(curr_dt))
+#     relation_df = relation_df.withColumn('start_dt', lit(curr_dt))
+#     relation_df = relation_df.withColumn('end_dt', lit(curr_dt))
+    #dt_cols = [ 'license_exp_dt', 'license_eff_dt']
+    #for dt_col in dt_cols:
+    #  relation_df = relation_df.withColumn(dt_col, time_format_convert(col(dt_col).cast('string'), lit('%Y-%m-%dT%H:%M:%S%z'), lit('%Y%m%d%H%M%S')))
+
+    relation_df = relation_df.filter(col("prac_id").isNotNull()).filter(col("addr_id").isNotNull()).filter("prac_id != ''").filter("addr_id != ''")
+    relation_df = relation_df.select('data_src_cd',col('prac_id').alias('start_obj_id'),col('addr_id').alias('end_obj_id'),'ingstn_dt')  
+    #relation_df = relation_df.fillna("")
+    relation_df = relation_df.filter(col("start_obj_id").isNotNull()).filter(col("end_obj_id").isNotNull())
+    display(relation_df)
+    
+    table_name= config.get('target',{}).get('table_name',{})
+    table_schema = config.get('target',{}).get('table_schema',{})
+    table_path= config.get('target',{}).get('table_location',{})
+    table_location= table_path +table_name+ "/"
+    partition= config.get('target',{}).get('partition_columns',{})
+    table_format= config.get('target',{}).get('table_format',{})
+    target_table_name = f"{table_schema}.{table_name}"
+
+    create_table_database(logging,table_schema,check_is_folder(table_location))
+    if not check_table_exist(table_schema, table_name):
+      relation_df.write.option("path", table_location).option("overwriteSchema","true").partitionBy(partition).format("delta").mode(write_mode).saveAsTable(target_table_name)
+
+
+# COMMAND ----------
+
+
+
+def processInputFile(curr_dt,config,custom_load_filter=None):
+    # get the files from s3 cds bucket
+    #logging.info('Fetch input json files from s3 bucket: {0}'.format('da-datastore-provider.dev-cignasplithorizon'))
+    bucket=config.get('source',{}).get('bucket',{})
+    s3_client = boto3.client('s3')
+    input_s3_path = bucket + '/caqh/date=' + curr_dt
+    items = []
+    name=config['name']
+    prac_df = spark.createDataFrame([], pracInfo_schema)
+    prac_nm_df = spark.createDataFrame([], pracNmInfo_schema)
+    prac_lang_df = spark.createDataFrame([], pracLangInfo_schema)
+    prac_prfsnl_df = spark.createDataFrame([], pracPrfsnlInfo_schema)
+    prac_licns_df = spark.createDataFrame([], pracLicnsInfo_schema)
+    prac_speclty_df = spark.createDataFrame([], pracSpecltyInfo_schema)
+    prac_eductn_df = spark.createDataFrame([], pracEductnInfo_schema)
+    prac_idty_df = spark.createDataFrame([], pracIdTyInfo_schema)    
+    prac_loc_df = spark.createDataFrame([], pracLocInfo_schema)
+    prac_speclty_exptr_df = spark.createDataFrame([], pracSpecltyExpTrainInfo_schema)
+    try:
+        if custom_load_filter==None:
+          json_files = get_all_s3_keys(input_s3_path, s3_client)
+        else:
+          json_files = get_custom_s3_keys(input_s3_path, s3_client,custom_load_filter)
+        #logging.info("json files in cds bucket {0}".format(json_files))
+        if len(json_files) == 0:
+            logging.info("No json files in cds bucket folder {0}". \
+                            format(curr_dt))
+            exit(1)
+    except Exception as e:
+        logging.error("failed to get the s3 keys from cds bucket with error {0}" \
+                        .format(traceback.format_exc()))
+        exit(1)
+    try:
+        for jsonfile in json_files:
+            logging.info("Processing file {0}".format(jsonfile))
+            df = spark.read.option("multiline","true").json(f"s3://{bucket}/{jsonfile}")
+            # iterate through practitioner
+            if 'Recon.json' not in jsonfile:
+                getPracInfo = udf(getPracInfo_format, prac_info_output_schema)   #getPracInfo = udf(getPracInfo_format, StringType())
+                df_prac_info1 = df.withColumn("data_pracInfo1", getPracInfo(col("data")))
+                data_pracInfo1_pracInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracInfo))              
+                data_pracInfo1_pracNmInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracNmInfo))              
+                data_pracInfo1_pracLangInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracLangInfo))            
+                data_pracInfo1_pracPrfsnlInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracPrfsnlInfo))             
+                data_pracInfo1_pracLicnsInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracLicnsInfo))            
+                data_pracInfo1_pracSpecltyInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracSpecltyInfo))              
+                data_pracInfo1_pracEductnInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracEductnInfo))        
+                data_pracInfo1_pracLocInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracLocInfo))             
+                data_pracInfo1_pracIdTyInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracIdTyInfo))
+                data_pracInfo1_pracSpecltyExpTrainInfo = df_prac_info1.select(explode_outer(df_prac_info1.data_pracInfo1.pracSpecltyExpTrainInfo))
+                prac_df=prac_df.union(flatten_df(data_pracInfo1_pracInfo).distinct())
+                prac_nm_df=prac_nm_df.union(flatten_df(data_pracInfo1_pracNmInfo).distinct())
+                prac_lang_df=prac_lang_df.union(flatten_df(data_pracInfo1_pracLangInfo).distinct())
+                prac_prfsnl_df=prac_prfsnl_df.union(flatten_df(data_pracInfo1_pracPrfsnlInfo).distinct())
+                prac_licns_df=prac_licns_df.union(flatten_df(data_pracInfo1_pracLicnsInfo).distinct())
+                prac_speclty_df=prac_speclty_df.union(flatten_df(data_pracInfo1_pracSpecltyInfo).distinct())
+                prac_eductn_df=prac_eductn_df.union(flatten_df(data_pracInfo1_pracEductnInfo).distinct())
+                prac_idty_df=prac_idty_df.union(flatten_df(data_pracInfo1_pracIdTyInfo).distinct())
+                prac_loc_df=prac_loc_df.union(flatten_df(data_pracInfo1_pracLocInfo).distinct())
+                prac_speclty_exptr_df=prac_speclty_exptr_df.union(flatten_df(data_pracInfo1_pracSpecltyExpTrainInfo).distinct())
+            else:
+                getRecInfo= udf(recon_data_format, recon_output_schema)
+                rec_info = df.withColumn("recon_data", getRecInfo("data"))
+                df_recon_info=rec_info.select((rec_info.recon_data.pracReconInfo.file_nm).alias("file_nm"), (rec_info.recon_data.pracReconInfo.batch_cnt).alias("batch_cnt"), (rec_info.recon_data.pracReconInfo.batch_size).alias("each_batch_size"), (rec_info.recon_data.pracReconInfo.rcvd_practnr_cnt).alias("src_rcvd_practnr_cnt"), (rec_info.recon_data.pracReconInfo.err_practnr_cnt).alias("src_err_practnr_cnt"))
+
+        if(name=="reltio_hcp"):
+          writeHcpToS3 (curr_dt, prac_df, prac_nm_df, prac_lang_df, prac_prfsnl_df, prac_licns_df, prac_speclty_df, prac_eductn_df, prac_idty_df, prac_speclty_exptr_df,config)        
+        elif(name=="reltio_loc"):
+          writeLocToS3 (curr_dt, prac_df, prac_loc_df, config)
+        elif(name=="reltio_recon"):
+          writeReconToS3(curr_dt, df_recon_info, config)
+        elif(name=="reltio_relation"):
+          writeRelationToS3(curr_dt,prac_df,prac_loc_df, config)
+    except Exception as e:
+        logging.error("processing failed for file {0} with error {1}" \
+                        .format(jsonfile, traceback.format_exc()))
+    #try:
+    #    writeReconToS3(curr_dt)
+    #except Exception as e:
+    #    logging.error("failed to load from df to eds s3 bucket with error {0}" \
+    #                    .format(traceback.format_exc()))
+
+
+
+# dbutils.fs.rm("s3://evernorth-us-edp-dev-transformations/eds_provider/caqh_staging/reltio_hcp",True)
+# dbutils.fs.rm("s3://evernorth-us-edp-dev-transformations/eds_provider/caqh_staging/reltio_loc",True)
+# dbutils.fs.rm("s3://evernorth-us-edp-dev-transformations/eds_provider/caqh_staging/reltio_recon",True)
+# dbutils.fs.rm("s3://evernorth-us-edp-dev-transformations/eds_provider/caqh_staging/reltio_relation",True)
+
+
+# 
+def main():
+
+   #Main code input parameter
+#     dbutils.widgets.text('base_config_location', '')
+#     dbutils.widgets.text('AIRFLOW_JOB_TIMESTAMP', '')
+#     dbutils.widgets.text('load_type', '')
+#     dbutils.widgets.text('custom_load_dates','')
+#     dbutils.widgets.text('config_list', '')
+  
+#     base_config_location: str = dbutils.widgets.get('base_config_location')
+#     airflow_job_timestamp = dbutils.widgets.get("AIRFLOW_JOB_TIMESTAMP")
+#     load_type = dbutils.widgets.get("load_type")
+#     custom_load_dates = dbutils.widgets.get("custom_load_dates").split(",")
+    
+#     airflow_date = datetime.strptime(airflow_job_timestamp, '%Y%m%d%H%M%S')
+#     airflow_job_date = airflow_date.strftime('%Y-%m-%d')
+
+#     config_list: str = dbutils.widgets.get('config_list')
+
+#     if len(base_config_location) == 0 or len(config_list) == 0:
+#         raise Exception("base_config_location or config_list is empty")
+
+#     for i, fname in enumerate(config_list.split(",")):
+#         try:
+#             logger = get_logger(group=os.environ.get('group_name'), logger_name=fname)
+#         except NameError as logger_exception:
+#             logger = local_get_logger(fname)
+#         config_location = os.path.join(base_config_location.strip(), fname.strip())
+#         config = download_yaml_from_s3(config_location)
+    load_type = 'custom'
+    airflow_job_timestamp ="20210323235559"
+    airflow_date = datetime.strptime(airflow_job_timestamp, '%Y%m%d%H%M%S')
+    airflow_job_date = airflow_date.strftime('%Y-%m-%d')
+#     
+    dbutils.widgets.text('custom_load_dates','')
+    custom_load_dates = dbutils.widgets.get("custom_load_dates").split(",")
+    
+    dbutils.widgets.text('custom_load_filter','')
+    custom_load_filter = dbutils.widgets.get("custom_load_filter")
+    
+    config1 = {'name': 'reltio_hcp', 'domain': 'provider', 'environment': 'dev', 'source': {'path': 's3://da-datastore-provider.dev-cignasplithorizon/caqh/', 'bucket': 'da-datastore-provider.dev-cignasplithorizon'}, 'target': {'table_name': 'reltio_hcpp', 'table_schema': 'eds_provider_staging', 'table_location': 's3://edp-transformations-dev/eds_provider/delta_staging/eds_provider_staging/', 'table_format': 'delta', 'partition_columns': ['ingstn_dt']}}  
+
+    config2 =   {'name': 'reltio_loc', 'domain': 'provider', 'environment': 'dev',  'dq': {'dlq': 's3://evernorth-us-edp-test-transformations/client/dlq/int/reltio_loc', 'rule': 'yes'},  'source': {'path': 's3://da-datastore-provider.dev-cignasplithorizon/caqh/', 'bucket': 'da-datastore-provider.dev-cignasplithorizon'}, 'target': {'table_name': 'reltio_locc', 'table_schema': 'eds_provider_staging', 'table_location': 's3://edp-transformations-dev/eds_provider/delta_staging/eds_provider_staging/', 'table_format': 'delta', 'partition_columns': ['ingstn_dt']}}  
+   
+    config3 = {'name': 'reltio_recon', 'domain': 'provider', 'environment': 'dev', 'source': {'path': 's3://da-datastore-provider.dev-cignasplithorizon/caqh/', 'bucket': 'da-datastore-provider.dev-cignasplithorizon'}, 'target': {'table_name': 'reltio_reconn', 'table_schema': 'eds_provider_staging', 'table_location': 's3://edp-transformations-dev/eds_provider/delta_staging/eds_provider_staging/', 'table_format': 'delta', 'partition_columns': ['ingstn_dt']}}
+
+    config4 =  {'name': 'reltio_relation', 'domain': 'provider', 'environment': 'dev', 'source': {'path': 's3://da-datastore-provider.dev-cignasplithorizon/caqh/', 'bucket': 'da-datastore-provider.dev-cignasplithorizon'}, 'target': {'table_name': 'reltio_relationn', 'table_schema': 'eds_provider_staging', 'table_location': 's3://edp-transformations-dev/eds_provider/delta_staging/eds_provider_staging/', 'table_format': 'delta', 'partition_columns': ['ingstn_dt']}}
+  
+  
+    config_list=[config1,config2,config3,config4]
+
+    for i, fname in enumerate(config_list):
+        #print(fname)
+#         try:
+#             logger = get_logger(("py4j", logger_name="test_caqh")
+#             logging.getLogger("py4j").setLevel(logging.WARNING)
+#         except NameError as logger_exception:
+#             logger = local_get_logger(fname)
+        source_path=fname.get('source',{}).get('path',{})
+        s3_client = boto3.client('s3')
+    
+        curr_date=find_curr_dt(load_type,airflow_job_date,source_path,s3_client,custom_load_dates)
+        if custom_load_filter:
+          print("custom load filter works")
+          processInputFile(curr_date[0],fname,custom_load_filter)
+        elif custom_load_filter=='':
+          print("no custom filter")
+          for date in curr_date:
+            processInputFile(date,fname)        
+
+if __name__ == "__main__":
+    main()
+
+# COMMAND ----------
+
+
+
+def get_all_s3_keys(s3_path, s3_client):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        #print(resp['KeyCount'])
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].endswith(".json") and not obj['Key'].split('/')[-1].startswith('.'):
+                keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+
+def check_if_key_exist(bucket, key):
+    """
+    check if given key exists in bucket or not
+    :param bucket: bucket name as string
+    :param key: object key as string
+    :return: Boolean
+    """
+    s3 = boto3.resource('s3')
+    bucket = s3.Bucket(bucket)
+    for object_summary in bucket.objects.filter(Prefix=key):
+        return True
+    return False
+
+
+def get_relto_config(entities, file):
+    """
+    get reltion config for entities
+    :param config:
+    :param sc:
+    :param glue_spark:
+    :param curr_dt:
+    :param entities:
+    :return:
+    """
+    person_dict = file
+    final_output = {}
+    
+    for e in entities:
+      if (e.startswith('configuration/entityTypes/')):
+        for entity in person_dict['entityTypes']:
+          for req in entities:
+              if entity['uri'] == req:
+                  print("Entity found {0}".format(req))
+                  final_output[req] = entity['attributes']
+                  break
+      elif (e.startswith('configuration/relationTypes/')):
+        for entity in person_dict['relationTypes']:
+          for req in entities:
+              if entity['uri'] == req:
+                  print("Entity found {0}".format(req))
+                  final_output[req] = entity['attributes']
+                  break
+      else:
+          print("Entity not found {0}".format(req))
+    return final_output  
+  
+  
+# def get_relation_config(entities, file):
+#     """
+#     get reltion config for entities
+#     :param config:
+#     :param sc:
+#     :param glue_spark:
+#     :param curr_dt:
+#     :param entities:
+#     :return:
+#     """
+#     person_dict = file
+#     final_output = {}
+#     for entity in person_dict['relationTypes']:
+#         for req in entities:
+#             if entity['uri'] == req:
+#                 print("Entity found {0}".format(req))
+#                 final_output[req] = entity['attributes']
+#                 break
+#             #else:
+#             #    print("Entity not found {0}".format(req))
+#     return final_output  
+
+def prepare_string_object(val):
+    """
+    takes String and return the Array of Json Object
+    :param val:
+    :return:
+    """
+    if val:
+        return [{"value": str(val)}]
+    else:
+        return None
+
+
+def prepare_refernce_object(val):
+    """
+    yet to implement at this point using String
+    :return:
+    """
+    return prepare_string_object(val)
+
+
+def prepare_boolena_object(val):
+    """
+    yet to implement at this point using String
+    :param val:
+    :return:
+    """
+    return prepare_string_object(val)
+
+
+def prepare_nested_attributes(parent_atrr_name, element, attributes):
+    """
+    Parse the nested Reltio Data type and send Array of Objects
+    :param parent_atrr_name:
+    :param element:
+    :param attributes:
+    :return:
+    """
+    list_final = []
+    nested_val_object = {}
+    for ele_dic in element:
+        d1 = {}
+        for key in ele_dic.keys():
+            for att in attributes:
+                try:
+                    #print("att['name']  {0},{1} ".format(att['name'], key))
+                    #print(key.lower() == att['name'].lower())
+                    if key.lower() == att['name'].lower():
+                        # print(nested_val_object)
+                        res = get_reltio_object(
+                            type=att['type'],
+                            name=key,
+                            element=ele_dic[key],
+                            attributes=att.get(
+                                'attributes',
+                                []))
+                        if res:
+                            d1[key] = res
+                        break
+                except KeyError:
+                    pass
+        nested_val_object['value'] = d1
+        list_final.append(nested_val_object)
+        # list_1.append(wrapper)
+    return list_final
+
+
+def get_reltio_object(type, name, element, attributes=[]):
+    """
+
+    :param type: String
+    :param name:  name of the feild
+    :param element: array of Json object (data)
+    :param attributes: array of attribe object
+    :return: None or json array of Objects
+    """
+    #print("called the get_reltio_object type::: {0} ,name :::  {1}, element::::{2} attributes::{3}".format(type,name ,element,attributes))
+    if type == "String":
+        return prepare_string_object(element)
+    elif type == 'Nested':
+        return prepare_nested_attributes(name, element, attributes)
+    elif type == 'Boolean':
+        return prepare_boolena_object(element)
+    elif type == 'Date':
+        return prepare_string_object(element)
+    elif type == 'Blob':
+        return prepare_string_object(element)
+    elif type == 'Reference':
+        return prepare_refernce_object(element)
+    elif type == 'URL':
+        return prepare_string_object(element)
+    else:
+        print("Invalid type passed")
+        return
+
+ 
+def prepare_reltio_attributes(data_dict, attributes):
+    """
+    Top layer of Reltio Post json array of atrribute objects
+    :param dict: data dictionary
+    :param
+    :return:
+    """
+    wrapper_data = {}
+    for key in data_dict.keys():
+        #print(key)
+        for att in attributes:
+            try:
+                if (att['name'].lower() == key.lower()):
+                    res = get_reltio_object(
+                        type=att['type'],
+                        name=att['name'],
+                        element=data_dict[key],
+                        attributes=att.get(
+                            'attributes',
+                            []))
+                    if res:
+                        wrapper_data[key] = res
+                    break
+            except KeyError:
+                pass
+    return {"attributes": wrapper_data}
+
+
+def get_value_String_type():
+    return {"containsNull": True,
+            "elementType": {"fields": [{"metadata": {},
+                                        "name": "value",
+                                        "nullable": True,
+                                        "type": "string"}],
+                            "type": "struct"},
+            "type": "array"}
+
+
+def parse_nested(in_dict):
+    wrap_fld = {
+        "metadata": {},
+        "name": "value",
+        "nullable": True
+    }
+    for key in in_dict['elementType']["fields"]:
+        if isinstance(key['type'], str):
+            key['type'] = get_value_String_type()
+        elif isinstance(key['type'], dict):
+            key['type'] = parse_nested(key['type'])
+    wrap_fld["type"] = {
+        "type": "struct",
+        "fields": in_dict['elementType']["fields"]}
+    in_dict['elementType']["fields"] = [wrap_fld]
+
+    return in_dict
+
+
+
+
+def construct_relto_df_schema(json_in):
+    # print(json_in.keys())
+    isrelation = False
+    for key in json_in["fields"]:
+        if key['name'] in ['startObject','endObject']:
+          start_object= {'metadata': {}, 'name': 'startObject', 'nullable': False, 'type': {'fields': [{'metadata': {}, 'name': 'crosswalks', 'nullable': False, 'type': {'containsNull': False, 'elementType': {'fields': [{'metadata': {}, 'name': 'type', 'nullable': False, 'type': 'string'}, {'metadata': {}, 'name': 'value', 'nullable': True, 'type': 'string'}, {'metadata': {}, 'name': 'sourceTable', 'nullable': False, 'type': 'string'}], 'type': 'struct'}, 'type': 'array'}}], 'type': 'struct'}}
+          end_object = {'metadata': {}, 'name': 'endObject', 'nullable': False, 'type': {'fields': [{'metadata': {}, 'name': 'crosswalks', 'nullable': False, 'type': {'containsNull': False, 'elementType': {'fields': [{'metadata': {}, 'name': 'type', 'nullable': False, 'type': 'string'}, {'metadata': {}, 'name': 'value', 'nullable': True, 'type': 'string'}, {'metadata': {}, 'name': 'sourceTable', 'nullable': False, 'type': 'string'}], 'type': 'struct'}, 'type': 'array'}}], 'type': 'struct'}}
+          isrelation = True
+        else:
+          if isinstance(key['type'], str):
+              key['type'] = get_value_String_type()
+          elif isinstance(key['type'], dict):
+              key['type'] = parse_nested(key['type'])
+    attributes = {
+        "metadata": {},
+        "name": "attributes",
+        "nullable": True,
+        "type": json_in}
+
+    type = {"metadata": {}, "name": "type", "nullable": True, "type": "string"}
+    crosswalk = {
+        "metadata": {},
+        "name": "crosswalks",
+        "nullable": True,
+        "type": {
+            "containsNull": True,
+            "elementType": {
+                "fields": [
+                    {
+                        "metadata": {},
+                        "name": "sourceTable",
+                        "nullable": True,
+                        "type": "string"
+                    },
+                    {
+                        "metadata": {},
+                        "name": "type",
+                        "nullable": True,
+                        "type": "string"
+                    },
+                    {
+                        "metadata": {},
+                        "name": "value",
+                        "nullable": True,
+                        "type": "string"
+                    }
+                ],
+                "type": "struct"
+            },
+            "type": "array"
+        }
+    }
+    if isrelation:
+      wrap = {"fields": [attributes, type, crosswalk, start_object, end_object], "type": "struct"}
+    else:
+      wrap = {"fields": [attributes, type, crosswalk], "type": "struct"}
+    return wrap
+
+def get_update_params(body):
+    """Given a dictionary we generate an update expression and a dict of values
+
+    to update a dynamodb table.
+    ref "https://stackoverflow.com/questions/34447304/example-of-update-item-in-dynamodb-boto3"
+    Params:
+        body (dict): Parameters to use for formatting.
+
+    Returns:
+        update expression, dict of values.
+    """
+    update_expression = ["set "]
+    update_values = dict()
+
+    for key, val in body.items():
+        update_expression.append(f" {key} = :{key},")
+        update_values[f":{key}"] = val
+
+    return "".join(update_expression)[:-1], update_values
+
+
+class Reltio:
+    def __init__(self, broadcast_reltio_config):
+        self.broadcast_reltio_config = broadcast_reltio_config
+
+    def apply_reltio_structure(self, row):
+        """
+        UDF function to convert the Row into Reltio Json
+        Note: Row if Reltio type nested, Row should be in Json Array of object
+        :param row:
+        :return: String Json object
+        """
+        # get_relto_config()
+        in_dict = row.asDict(recursive=True)
+        reltio_config = self.broadcast_reltio_config[in_dict['type']]
+        # print(reltio_config)
+        reltio_att = {}
+        reltio_att['type'] = in_dict['type']
+        reltio_att['crosswalks'] = in_dict['crosswalks']
+        if in_dict['type'].startswith('configuration/relationTypes'):
+          reltio_att['startObject'] = in_dict['startObject']
+          reltio_att['endObject'] = in_dict['endObject']
+          try:
+              del in_dict['startObject']
+              del in_dict['endObject']
+          except KeyError:
+              pass
+        try:
+            del in_dict['crosswalks']
+            del in_dict['type']
+        except KeyError:
+            pass
+        # print(reltio_config)
+        reltio_att["attributes"] = prepare_reltio_attributes(
+            in_dict, reltio_config)['attributes']
+        # print("Converted Tow ",json.dumps(reltio_att))
+        return json.dumps(reltio_att)
+
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC --select * from eds_provider_staging.caqh_reltio_hcp;
+# MAGIC --select * from eds_provider_staging.caqh_reltio_loc;
+# MAGIC --select * from eds_provider_staging.caqh_reltio_hcploc_relation;
+
+
+# logging.getLogger("py4j").setLevel(logging.WARNING)
+# logger = logging.getLogger("py4j")
+
+def create_merge_condition_on_key(key_list):
+    conditions = list(map(lambda str: f"s.{str} = t.{str}", key_list))
+    return " and ".join(conditions)
+def deduplicate_rownumber(df, keys, sort_columns):
+    """
+    Performs deduplication using row_number function on key columns
+    and sort_columns
+    """
+    sort_columns_with_order = create_sort_columns(sort_columns)
+    return (df
+            .withColumn("row_number", row_number().over(Window.partitionBy(*keys).orderBy(*sort_columns_with_order)))
+            .filter(col("row_number") == 1)
+            .drop(col("row_number"))
+            )
+def create_sort_columns(sort_columns):
+    # if column is of format 'NAME:DESC' - do 'col(name).desc()'
+    # else if column is of 'NAME:ASC' or just NAME - do 'col(name)'
+    res = []
+    for c in sort_columns:
+        if c.endswith(":DESC"):
+            res.append(col(c.split(":")[0]).desc())
+        else:
+            res.append(col(c.split(":")[0]))
+    return res
+
+  
+  
+  
+def caqh_reltio_mdm_load(reltio_config_file, date):
+    """
+    Function that reads reltio_#hcp and reltio_location table and breaks it into reltio schema json for REST API input to push data into Reltio tool
+    """
+
+    if date:
+        curr_dt = date
+    else:
+        curr_dt = datetime.now().strftime("%Y%m%d")
+            
+    #batch_id="_".join(cmd_arg['key'].split('/')[-1].split("_")[:3])
+    #print("Ingestion date is ", curr_dt)
+    reltio_entity_conf = get_relto_config(
+        ["configuration/entityTypes/HCP",
+         "configuration/entityTypes/Location","configuration/relationTypes/HasAddress"],
+        reltio_config_file)
+    broadcast_reltio_config = reltio_entity_conf
+    for table in ['reltio_hcpp','reltio_locc','reltio_relationn']:
+      spark.sql("select * from eds_provider_staging.{0} where ingstn_dt='{1}'".format(table,
+                                                               curr_dt)).createOrReplaceTempView(f"{table}_latest")
+      if table == 'reltio_hcpp':
+        reltio_df = spark.sql(f"select ingstn_dt as ingstn_dt,'configuration/entityTypes/HCP' as type, Name as Names, Email as Email, ProfType as ProfType, Gender as Gender, DoB as DoB, 'CPG' as CPG, SpokenLanguage as SpokenLanguage, Identifiers as Identifiers, Specialities as Specialities, websiteurl as WebsiteURL, License as License, Education as Education, ssn as SSN, ssnlast4 as SSNLast4, Competency as Competencies, crosswalks as crosswalks, reltio_end_dt as endDate, prac_id as Id, data_src_cd as Source from (select prac_id, data_src_cd, collect_set(named_struct('NameType', names_nm_ty, 'FirstName', names_frst_nm, 'MiddleName', names_mid_nm, 'LastName', names_lst_nm, 'SuffixName', names_sfx_nm)) as Name, collect_set(named_struct('Email',email_email, 'Type',email_ty, 'ValidationStatus',email_validtn_sts))as Email, prof_ty as ProfType, gender as Gender, brth_dt as DoB, lang_spoken as SpokenLanguage, collect_set(named_struct('Type', identifiers_ty, 'ID',identifiers_id, 'Status', identifiers_sts, 'ExpirationDate', identifiers_exp_dt, 'State', identifiers_state, 'Issuer', identifiers_issuer, 'ActivationDate', identifiers_actvtn_dt, 'DeactivationReasonCode', identifiers_deactvtn_rsn_cd, 'DeactivationDate', identifiers_deactvtn_dt, 'ReactivationDate', identifiers_reactvtn_dt, 'CreateDate', identifiers_create_dt, 'LastupdateDate', identifiers_lst_upd_dt)) as Identifiers, collect_set(named_struct('Specialty', specialities_spec_cd, 'Primary', specialities_primary)) as Specialities, website_url as websiteurl, collect_set(named_struct('Number', license_num, 'ExpirationDate', license_exp_dt, 'EffectiveDate', license_eff_dt, 'State', license_state, 'Status', license_sts, 'Type', license_ty)) as License, collect_set(named_struct('SchoolCode', education_schl_cd, 'SchoolName', education_schl_nm, 'Type', education_ty, 'Completed', education_compl, 'Degree', education_dgree, 'StartYear', education_start_yr, 'EndYear', education_end_yr)) as Education, ssn as ssn, ssnlast4 as ssnlast4, collect_set(named_struct('LGBTIssues', lgbt_issues, 'GenderDysphoria', gender_idnty_disorder, 'HIVAIDS',hiv_aids)) as Competency,collect_set(named_struct('type', 'configuration/sources/CAQH', 'value', prac_id, 'sourceTable','CAQH_PRAC')) as crosswalks, reltio_end_dt, ingstn_dt from {table}_latest group by prac_id, data_src_cd, email_email, prof_ty, gender, brth_dt, lang_spoken, website_url, ssn, ssnlast4, reltio_end_dt, ingstn_dt) base")
+        display(reltio_df)
+          
+      elif table == 'reltio_locc':
+        reltio_df = spark.sql(f"with reltio_loc_fnl as (select addr_id , data_src_cd, addr1 as AddressLin, addr2 as AddressLine, city as city, state_provnce as stateProvince, country as country, collect_set(named_struct('zip5', zip5, 'zip4', zip4)) as ZipCode, sub_admin_area as SubAdministative, dept as DeptName, collect_set(named_struct('latitude', geolocation_latitude,'longitude',geolocation_longitude,'GeoAccuracy',geolocation_geoaccuracy)) as Location, flr as flr, bldg as building, pobox as pobox, stdz_flag as Standardization,addr_ty as addressType, collect_set(named_struct('Type', phone_ty, 'AreaCode', phone_area_cd, 'Number', phone_num)) as phone, is_primary as primary, addr_ref_rel_reltio_xwalk_src_id as src_id, collect_set(named_struct('type','configuration/sources/CAQH','value',addr_id,'sourceTable',	'CAQH_ADDR'))	as crosswalk, reltio_end_dt, ingstn_dt from {table}_latest group by addr_id, data_src_cd, reltio_end_dt,addr1,addr2,city, state_provnce ,country,sub_admin_area, dept ,flr,bldg, pobox,stdz_flag,addr_ty,is_primary,addr_ref_rel_reltio_xwalk_src_id, ingstn_dt) select  addr_id as id, data_src_cd as Source, ingstn_dt as ingstn_dt ,'configuration/entityTypes/Location' as type, AddressLin as AddressLine1, AddressLine as AddressLine2, city as City, stateProvince as StateProvince, country as Country, ZipCode as Zip, SubAdministative as SubAdministrativeArea, DeptName as Dept, Location as GeoLocation, flr as Floor, building as Building, pobox as POBox, Standardization as StandardizationFlag, addressType as AddressType, phone as Phone, primary as Primary, src_id as SrcID, crosswalk as crosswalks, reltio_end_dt as endDate from reltio_loc_fnl")
+        display(reltio_df)
+      
+      elif table=='reltio_relationn':
+        reltio_df = spark.sql(f"with relation_tab as (select  ingstn_dt as ingstn_dt,'configuration/relationTypes/HasAddress' as type,  data_src_cd as data_src_cd,  start_obj_id,  end_obj_id,crosswalks as crosswalks from (select data_src_cd, start_obj_id,  end_obj_id, collect_set(named_struct('type', 'configuration/sources/CAQH', 'value', concat(start_obj_id,'_',end_obj_id), 'sourceTable','CAQH_PRAC_ADDR')) as crosswalks, ingstn_dt from {table}_latest where end_obj_id is not null and start_obj_id is not null group by start_obj_id,end_obj_id,data_src_cd, ingstn_dt) base) select concat(start_obj_id,'_',end_obj_id) as id, ingstn_dt, data_src_cd as Source, 'configuration/relationTypes/HasAddress' as type, collect_set(named_struct('type', 'configuration/sources/CAQH', 'value', concat(start_obj_id,'_',end_obj_id), 'sourceTable','CAQH_PRAC_ADDR')) as crosswalks, named_struct('crosswalks' , collect_set(named_struct('type', 'configuration/sources/CAQH', 'value', start_obj_id, 'sourceTable','CAQH_PRAC'))) as startObject, named_struct('crosswalks' , collect_set(named_struct('type', 'configuration/sources/CAQH', 'value', end_obj_id, 'sourceTable','CAQH_ADDR'))) as endObject from relation_tab group by start_obj_id,end_obj_id,data_src_cd, ingstn_dt")
+  
+      relto_json_schema = json.dumps(
+          construct_relto_df_schema(
+              json.loads(
+                  reltio_df.schema.json())))
+      apply_reltio_udf = udf(
+          Reltio(broadcast_reltio_config).apply_reltio_structure,
+          StringType())
+      reltio_struc_df = reltio_df.withColumn("reltio_formatted", apply_reltio_udf(
+          struct([reltio_df[x] for x in reltio_df.columns])))
+      reltio_struc_df = reltio_struc_df.select("reltio_formatted","id","Source","type","ingstn_dt")
+      #print("***************************************reltio_df***********************************************")
+      display(reltio_struc_df)
+      
+      if table=='reltio_hcpp':
+        config=config_hcp
+        table_schema=config['table_schema']
+        print(table_schema)
+        table_path=config['table_location']
+        print(table_path)
+        table_name=config['table_name']
+        print(table_name)
+        table_location=table_path+table_name+"/"
+        print(table_location)
+        target_table_name=f"{table_schema}.{table_name}"
+        print(target_table_name)
+        print("upsert func called for hci")
+        exists = DeltaTable.isDeltaTable(spark,table_location)
+        print(exists)
+        if not exists:
+          create_table_database(logging,table_schema,check_is_folder(table_location))
+          existing_table = DeltaTable.createIfNotExists(spark).tableName(target_table_name).addColumns(reltio_struc_df.schema).partitionedBy("ingstn_dt").execute()
+        else:
+          existing_table = DeltaTable.forPath(spark, table_location)
+          
+        df_to_merge = deduplicate_rownumber(reltio_struc_df, ['id'], ['ingstn_dt'])
+        #print(df_to_merge.columns)
+        merge_conditions = create_merge_condition_on_key(['id'])
+        #print(merge_conditions)
+        #print(existing_table.columns)
+        existing_table.alias("t").merge(
+            df_to_merge.alias("s"),
+            merge_conditions) \
+            .whenMatchedUpdateAll() \
+            .whenNotMatchedInsertAll() \
+            .execute()
+        existing_df=existing_table.toDF()       
+        df = existing_df.withColumn("reltio_formatted", from_json(existing_df["reltio_formatted"], relto_json_schema))
+#         print("############# HCP_DF #############")
+#         display(existing_df)
+      elif table=='reltio_locc':
+        config=config_loc
+        table_schema=config['table_schema']
+        table_path=config['table_location']
+        table_name=config['table_name']
+        table_location=table_path+table_name+"/"
+        target_table_name=f"{table_schema}.{table_name}"
+        print("upsert func called for loc")
+        exists = DeltaTable.isDeltaTable(spark, table_location)
+        #print(exists)
+        if not exists:
+          create_table_database(logging,table_schema,check_is_folder(table_location))
+          existing_table = DeltaTable.createIfNotExists(spark).tableName(target_table_name).addColumns(reltio_struc_df.schema).partitionedBy("ingstn_dt").execute()
+        else:
+          existing_table = DeltaTable.forPath(spark, table_location)
+          
+        df_to_merge = deduplicate_rownumber(reltio_struc_df, ['id'], ['ingstn_dt'])
+        merge_conditions = create_merge_condition_on_key(['id'])
+        existing_table.alias("t").merge(
+            df_to_merge.alias("s"),
+            merge_conditions) \
+            .whenMatchedUpdateAll() \
+            .whenNotMatchedInsertAll() \
+            .execute()
+        existing_df=existing_table.toDF()
+        df = existing_df.withColumn("reltio_formatted", from_json(existing_df["reltio_formatted"], relto_json_schema))
+#         print("############# loc_DF #############")
+#         display(existing_df)
+        
+      elif table=='reltio_relationn':
+        config=config_relation
+        table_schema=config['table_schema']
+        table_path=config['table_location']
+        table_name=config['table_name']
+        table_location=table_path+table_name+"/"
+        target_table_name=f"{table_schema}.{table_name}"
+        print("upsert func called for relation")
+        exists = DeltaTable.isDeltaTable(spark, table_location)
+        #print(exists)
+        if not exists:
+          create_table_database(logging,table_schema,check_is_folder(table_location))
+          existing_table = DeltaTable.createIfNotExists(spark).tableName(target_table_name).addColumns(reltio_struc_df.schema).partitionedBy("ingstn_dt").execute()
+        else:
+          existing_table = DeltaTable.forPath(spark, table_location)
+          
+        df_to_merge = deduplicate_rownumber(reltio_struc_df, ['id'], ['ingstn_dt'])
+        merge_conditions = create_merge_condition_on_key(['id'])
+        existing_table.alias("t").merge(
+            df_to_merge.alias("s"),
+            merge_conditions) \
+            .whenMatchedUpdateAll() \
+            .whenNotMatchedInsertAll() \
+            .execute()
+        existing_df=existing_table.toDF()
+        df = existing_df.withColumn("reltio_formatted", from_json(existing_df["reltio_formatted"], relto_json_schema))
+#         print("############# relation_DF #############")
+#         display(existing_df)
+      #display(not_yet)
+      
+#       table_name= config.get('target',{}).get('table_name',{})
+#       table_schema = config.get('target',{}).get('table_schema',{})
+#       table_path= config.get('target',{}).get('table_location',{})
+#       table_location= table_path +table_name+ "/"
+#       partition= config.get('target',{}).get('partition_columns',{})
+#       table_format= config.get('target',{}).get('table_format',{})
+#       target_table_name = f"{table_schema}.{table_name}"
+
+#       table_name= "caqh_reltio_formatted_table"
+#       table_schema = "eds_provider_staging"
+#       table_path="s3://edp-transformations-dev/eds_provider/delta_staging/eds_provider_staging/"
+#       table_location= table_path +table_name+ "/"
+#       partition= "ingstn_dt"
+#       table_format= "delta"
+#       target_table_name = f"{table_schema}.{table_name}"
+  
+#       create_table_database(logging,table_schema,check_is_folder(table_location))
+#       if not check_table_exist(table_schema, table_name):
+#         df.write.option("path", table_location).option("overwriteSchema","true").partitionBy(partition).format("delta").mode("overwrite").saveAsTable(target_table_name)
+      write_to_reltio(table,df.select("reltio_formatted", "ingstn_dt"), [ f"s3://da-datastore-reltio-ingestion.dev-cignasplithorizon/providermdm/{table}"])
+        
+def write_to_reltio(table, df, output_loc_list):
+    """
+    Write into reltio inbound
+    :param df:
+    :param outbound_final:
+    :return:
+    """
+    try:
+        total_records = int(df.count())
+        no_of_groups = (total_records // 15 + (1 if 1 <=
+                                               math.fmod(total_records, 15) else 0))
+        if table.endswith('relation'):
+          payload_type = "reltioRelationshipPayload"
+          update_type="create_relationship"
+          df1 = df.repartition(no_of_groups).withColumn(
+              "partitionId", spark_partition_id()).repartition(no_of_groups).groupby(
+              "partitionId", "ingstn_dt").agg(
+              collect_list('reltio_formatted').alias(payload_type))
+          result = df1.select(payload_type, "ingstn_dt").withColumn(
+              "reltioOperation", lit("partial_update")).withColumn(
+              "tenantId", lit("vTb03vnstGyyx6p")).withColumn('reltioEntityPayload', array())
+          #df1 = df.repartition(no_of_groups).withColumn(
+          #    "partitionId", spark_partition_id()).repartition(no_of_groups).groupby(
+          #    "partitionId", "ingstn_dt").agg(
+          #    collect_list('reltio_formatted').alias(payload_type))
+          #result = df1.select(payload_type, "ingstn_dt").withColumn(
+          #    "reltioOperation", lit(update_type)).withColumn(
+          #    "tenantId", lit("vTb03vnstGyyx6p")).withColumn('reltioEntityPayload', array())
+        else:
+          payload_type = "reltioEntityPayload"
+          update_type="update_entity"
+          df1 = df.repartition(no_of_groups).withColumn(
+              "partitionId", spark_partition_id()).repartition(no_of_groups).groupby(
+              "partitionId", "ingstn_dt").agg(
+              collect_list('reltio_formatted').alias(payload_type))
+          result = df1.select(payload_type, "ingstn_dt").withColumn(
+              "reltioOperation", lit(update_type)).withColumn(
+              "tenantId", lit("vTb03vnstGyyx6p"))
+        result_count = result.count()      
+        for write_to in output_loc_list:
+            result.repartition(result_count).write.format("json").mode("overwrite").option(
+                "maxRecordsPerFile", 1).partitionBy("ingstn_dt").save(write_to)
+    except Exception as ex:
+        logging.info(traceback.format_exc())
+        raise
+curr_dt="2021-03-23"
+caqh_reltio_mdm_load(reltio_config, curr_dt)
+
+
+
+# 
+def main():
+
+   #Main code input parameter
+#     dbutils.widgets.text('base_config_location', '')
+#     dbutils.widgets.text('AIRFLOW_JOB_TIMESTAMP', '')
+#     dbutils.widgets.text('load_type', '')
+#     dbutils.widgets.text('custom_load_dates','')
+#     dbutils.widgets.text('config_list', '')
+  
+#     base_config_location: str = dbutils.widgets.get('base_config_location')
+#     airflow_job_timestamp = dbutils.widgets.get("AIRFLOW_JOB_TIMESTAMP")
+#     load_type = dbutils.widgets.get("load_type")
+#     custom_load_dates = dbutils.widgets.get("custom_load_dates").split(",")
+    
+#     airflow_date = datetime.strptime(airflow_job_timestamp, '%Y%m%d%H%M%S')
+#     airflow_job_date = airflow_date.strftime('%Y-%m-%d')
+
+#     config_list: str = dbutils.widgets.get('config_list')
+
+#     if len(base_config_location) == 0 or len(config_list) == 0:
+#         raise Exception("base_config_location or config_list is empty")
+
+#     for i, fname in enumerate(config_list.split(",")):
+#         try:
+#             logger = get_logger(group=os.environ.get('group_name'), logger_name=fname)
+#         except NameError as logger_exception:
+#             logger = local_get_logger(fname)
+#         config_location = os.path.join(base_config_location.strip(), fname.strip())
+#         config = download_yaml_from_s3(config_location)
+    curr_dt="2021-03-23"
+    caqh_reltio_mdm_load(reltio_config, curr_dt)
+
+
+    load_type = 'custom'
+    airflow_job_timestamp ="20210323235559"
+    airflow_date = datetime.strptime(airflow_job_timestamp, '%Y%m%d%H%M%S')
+    airflow_job_date = airflow_date.strftime('%Y-%m-%d')
+#     
+    dbutils.widgets.text('custom_load_dates','')
+    custom_load_dates = dbutils.widgets.get("custom_load_dates").split(",")
+    
+    dbutils.widgets.text('custom_load_filter','')
+    custom_load_filter = dbutils.widgets.get("custom_load_filter")
+    
+    config_hcp = {'name': 'reltio_hcp', 'domain': 'provider', 'environment': 'dev', 'table_name': 'reltio_hcppp', 'table_schema': 'caqh_iz', 'table_location': 's3://edp-transformations-dev/eds_provider/delta_staging/eds_provider_staging/caqh_iz/, 'table_format': 'delta', 'partition_columns': ['ingstn_dt']}
+    config_loc = {'name': 'reltio_loc', 'domain': 'provider', 'environment': 'dev', 'table_name': 'reltio_loccc', 'table_schema': 'caqh_iz', 'table_location': 's3://edp-transformations-dev/eds_provider/delta_staging/eds_provider_staging/caqh_iz/', 'table_format': 'delta', 'partition_columns': ['ingstn_dt']}
+    config_relation = {'name': 'reltio_relation', 'domain': 'provider', 'environment': 'dev', 'table_name': 'reltio_relationnn', 'table_schema': 'caqh_iz', 'table_location': 's3://edp-transformations-dev/eds_provider/delta_staging/eds_provider_staging/caqh_iz/', 'table_format': 'delta', 'partition_columns': ['ingstn_dt']}
+    
+    config_list=[config_hcp,config_loc,config_relation]
+
+    for i, fname in enumerate(config_list):
+        #print(fname)
+#         try:
+#             logger = get_logger(("py4j", logger_name="test_caqh")
+#             logging.getLogger("py4j").setLevel(logging.WARNING)
+#         except NameError as logger_exception:
+#             logger = local_get_logger(fname)
+
+        curr_date=find_curr_dt(load_type,airflow_job_date,source_path,s3_client,custom_load_dates)
+        if custom_load_filter:
+          print("custom load filter works")
+          processInputFile(curr_date[0],fname,custom_load_filter)
+        elif custom_load_filter=='':
+          print("no custom filter")
+          for date in curr_date:
+            processInputFile(date,fname)        
+
+if __name__ == "__main__":
+    main()
+	
+	
+	
+	s3_path="s3://da-datastore-provider.dev-cignasplithorizon/caqh/date=2022-03-02/"
+s3_client =boto3.client('s3')
+custom_load_filter='20210401.104230-6070_AttestedOrRosteredOrAuthorized_Master_1'
+def get_all_s3_keys(s3_path, s3_client,custom_load_filter):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].split('/')[2].split('/')[0] == custom_load_filter:
+                print(obj['Key'])
+                if obj['Key'].endswith(".json") and not(obj['Key'].split('/')[-1].startswith('.')):
+                  keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+#config.get('source',{}).get('path',{})
+get_all_s3_keys(s3_path,s3_client,custom_load_filter)
+
+# if not s3://cds-internal-dropzone.dev-cignasplithorizon/accountadmin/date=2021-04-13/file.txt.split('/')[-1].startswith('.')
