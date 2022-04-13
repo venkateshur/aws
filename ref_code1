@@ -1,0 +1,390 @@
+# Databricks notebook source
+# Databricks notebook source
+"""
+Importing all required packages for the all the following logic in the notebook
+"""
+import logging
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType, BooleanType, LongType, Row
+from pyspark.sql.functions import  col,struct, explode_outer, posexplode_outer, explode, lit, udf, struct, spark_partition_id, collect_list, lit, from_json, concat
+from datetime import datetime
+from delta.tables import *
+import yaml
+from urllib.parse import urlparse
+import re
+import os
+import boto3
+import traceback
+import json
+import math
+import sys
+import configparser
+
+from pyspark.sql.functions import current_timestamp, lit, input_file_name, row_number, col, concat, md5, trim, col, to_timestamp, to_date, when, expr
+from pyspark.sql.window import Window
+from urllib.parse import urlparse
+from jsonschema import validate
+from datetime import datetime
+from dateutil import relativedelta
+from delta.tables import *
+from common_dq.service.dq_processor import DataQualityProcessor
+from common_dq.service.dq_utils import *
+from pyspark.sql.types import *
+
+import re
+import os
+import json
+import yaml
+import boto3
+import time
+from decimal import *
+from typing import cast, Dict, List
+from collections import defaultdict
+import watchtower
+import secrets
+
+
+# COMMAND ----------
+
+def download_yaml_from_s3(s3_uri):
+    """
+    Downloads the YAML file from given s3_uri.
+    Returns the value as a dictionary.
+    Arguments:
+    s3_uri -- the s3 URI in format s3://bucket/path/to/file.yaml
+    Returns:
+    YAML content loaded into a dictionary.
+    """
+    if s3_uri is None or not s3_uri.startswith("s3://"):
+        raise Exception('no or invalid S3 URI supplied')
+
+    parse_result = urlparse(s3_uri)
+    bucket = parse_result.netloc
+    path = parse_result.path
+
+    if path.startswith("/"):
+        path = path[1:]
+
+    if not bucket or not path or len(path) <= 1:
+        raise Exception('invalid bucket name or path to file supplied')
+
+    try:
+        s3_client = boto3.client('s3')
+        response = s3_client.get_object(Bucket=bucket, Key=path)
+        return yaml.safe_load(response["Body"])
+    except Exception as exc:
+        raise exc
+
+def flatten_df(nested_df):
+    """
+    flatten the incoming struct type/ nested columns in the data frame input given
+    """
+    flat_cols = [c[0] for c in nested_df.dtypes if c[1][:6] != 'struct']
+    nested_cols = [c[0] for c in nested_df.dtypes if c[1][:6] == 'struct']
+    flat_df = nested_df.select(flat_cols +
+                            [col(nc+'.'+c).alias(nc+'_'+c)
+                                for nc in nested_cols
+                                for c in nested_df.select(nc+'.*').columns])
+    return flat_df
+
+
+@udf("string")
+def time_format_convert(value, from_format, to_format):
+    """
+    convert time column given from a given python datetime format to target format if the incoming value is not null
+    """
+    if value:
+      date_time_obj = datetime.strptime(value, from_format)
+      return date_time_obj.strftime(to_format)
+    else:
+      return value
+
+def get_all_s3_keys(s3_path, s3_client):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        #print(resp['KeyCount'])
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].endswith(".json") and not obj['Key'].split('/')[-1].startswith('.'):
+                keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+
+  
+def get_custom_s3_keys(s3_path, s3_client,custom_load_filter):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].split('/')[2].split('/')[0] == custom_load_filter:
+                #print(obj['Key'])
+                if obj['Key'].endswith(".json") and not(obj['Key'].split('/')[-1].startswith('.')):
+                  keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+
+#config.get('source',{}).get('path',{})
+
+
+def create_table_database(logger, db_name, db_location):
+    """
+    Create the database on Hive metastore on the db_location.
+    If the database already exists in the given location, this will be a no-op.
+    Arguments:
+    db_name -- the name of the database to be created
+    db_location -- location in HDFS/S3/DBFS where it needs to be created
+    Throws:
+    Exception if a database with the same name already exists in a different location.
+    """
+    logger.info(f"Creating database {db_name} at '{db_location}'")
+    spark.sql(
+        f"""
+    CREATE DATABASE IF NOT EXISTS {db_name} LOCATION '{db_location}';
+    """
+    )
+    logger.info(f"created database {db_name} at '{db_location}'")
+
+
+def check_is_folder(path):
+    """
+    check provided is a folder or file and append the schema name to path
+    """
+    if path.endswith("/"):
+        return f"{path}"
+    else:
+        return f"{path}/"
+
+def check_table_exist(db_name,table_name):
+    """
+    """
+    try:
+        df=spark.sql(f'SHOW TABLES IN  {db_name} like "{table_name}"')
+        if df.count == 1:
+            return True
+        else:
+            return False
+    except AnalysisException as err:
+        log.error(err)
+        return False
+
+# COMMAND ----------
+# Databricks notebook source
+# Databricks notebook source
+"""
+Importing all required packages for the all the following logic in the notebook
+"""
+import logging
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType, BooleanType, LongType, Row
+from pyspark.sql.functions import  col,struct, explode_outer, posexplode_outer, explode, lit, udf, struct, spark_partition_id, collect_list, lit, from_json, concat
+from datetime import datetime
+from delta.tables import *
+import yaml
+from urllib.parse import urlparse
+import re
+import os
+import boto3
+import traceback
+import json
+import math
+import sys
+import configparser
+
+from pyspark.sql.functions import current_timestamp, lit, input_file_name, row_number, col, concat, md5, trim, col, to_timestamp, to_date, when, expr
+from pyspark.sql.window import Window
+from urllib.parse import urlparse
+from jsonschema import validate
+from datetime import datetime
+from dateutil import relativedelta
+from delta.tables import *
+from common_dq.service.dq_processor import DataQualityProcessor
+from common_dq.service.dq_utils import *
+from pyspark.sql.types import *
+
+import re
+import os
+import json
+import yaml
+import boto3
+import time
+from decimal import *
+from typing import cast, Dict, List
+from collections import defaultdict
+import watchtower
+import secrets
+
+
+# COMMAND ----------
+
+def download_yaml_from_s3(s3_uri):
+    """
+    Downloads the YAML file from given s3_uri.
+    Returns the value as a dictionary.
+    Arguments:
+    s3_uri -- the s3 URI in format s3://bucket/path/to/file.yaml
+    Returns:
+    YAML content loaded into a dictionary.
+    """
+    if s3_uri is None or not s3_uri.startswith("s3://"):
+        raise Exception('no or invalid S3 URI supplied')
+
+    parse_result = urlparse(s3_uri)
+    bucket = parse_result.netloc
+    path = parse_result.path
+
+    if path.startswith("/"):
+        path = path[1:]
+
+    if not bucket or not path or len(path) <= 1:
+        raise Exception('invalid bucket name or path to file supplied')
+
+    try:
+        s3_client = boto3.client('s3')
+        response = s3_client.get_object(Bucket=bucket, Key=path)
+        return yaml.safe_load(response["Body"])
+    except Exception as exc:
+        raise exc
+
+def flatten_df(nested_df):
+    """
+    flatten the incoming struct type/ nested columns in the data frame input given
+    """
+    flat_cols = [c[0] for c in nested_df.dtypes if c[1][:6] != 'struct']
+    nested_cols = [c[0] for c in nested_df.dtypes if c[1][:6] == 'struct']
+    flat_df = nested_df.select(flat_cols +
+                            [col(nc+'.'+c).alias(nc+'_'+c)
+                                for nc in nested_cols
+                                for c in nested_df.select(nc+'.*').columns])
+    return flat_df
+
+
+@udf("string")
+def time_format_convert(value, from_format, to_format):
+    """
+    convert time column given from a given python datetime format to target format if the incoming value is not null
+    """
+    if value:
+      date_time_obj = datetime.strptime(value, from_format)
+      return date_time_obj.strftime(to_format)
+    else:
+      return value
+
+def get_all_s3_keys(s3_path, s3_client):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        #print(resp['KeyCount'])
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].endswith(".json") and not obj['Key'].split('/')[-1].startswith('.'):
+                keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+
+  
+def get_custom_s3_keys(s3_path, s3_client,custom_load_filter):
+    # get list of all keys in S3 bucket with a specified path prefix
+    keys = []
+    if not s3_path.startswith('s3://'):
+        s3_path = 's3://' + s3_path
+    bucket = s3_path.split('//')[1].split('/')[0]
+    prefix = '/'.join(s3_path.split('//')[1].split('/')[1:])
+
+    kwargs = {'Bucket': bucket, 'Prefix': prefix}
+    while True:
+        resp = s3_client.list_objects_v2(**kwargs)
+        if resp['KeyCount'] > 0:
+            for obj in resp['Contents']:
+              if obj['Key'].split('/')[2].split('/')[0] == custom_load_filter:
+                #print(obj['Key'])
+                if obj['Key'].endswith(".json") and not(obj['Key'].split('/')[-1].startswith('.')):
+                  keys.append(obj['Key'])
+            try:
+                kwargs['ContinuationToken'] = resp['NextContinuationToken']
+            except KeyError:
+                break
+        else:
+            break
+    return keys
+
+#config.get('source',{}).get('path',{})
+
+
+def create_table_database(logger, db_name, db_location):
+    """
+    Create the database on Hive metastore on the db_location.
+    If the database already exists in the given location, this will be a no-op.
+    Arguments:
+    db_name -- the name of the database to be created
+    db_location -- location in HDFS/S3/DBFS where it needs to be created
+    Throws:
+    Exception if a database with the same name already exists in a different location.
+    """
+    logger.info(f"Creating database {db_name} at '{db_location}'")
+    spark.sql(
+        f"""
+    CREATE DATABASE IF NOT EXISTS {db_name} LOCATION '{db_location}';
+    """
+    )
+    logger.info(f"created database {db_name} at '{db_location}'")
+
+
+def check_is_folder(path):
+    """
+    check provided is a folder or file and append the schema name to path
+    """
+    if path.endswith("/"):
+        return f"{path}"
+    else:
+        return f"{path}/"
+
+def check_table_exist(db_name,table_name):
+    """
+    """
+    try:
+        df=spark.sql(f'SHOW TABLES IN  {db_name} like "{table_name}"')
+        if df.count == 1:
+            return True
+        else:
+            return False
+    except AnalysisException as err:
+        log.error(err)
+        return False
+
+# COMMAND ----------
