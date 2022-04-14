@@ -1,3 +1,5 @@
+from pyspark.sql.functions import explode_outer,col
+
 def flatten_df(nested_df):
     flat_cols = [c[0] for c in nested_df.dtypes if (c[1][:6] != 'struct' or c[1][:6] == 'struct')]
     print(flat_cols)
