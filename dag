@@ -1,0 +1,219 @@
+import os
+import requests
+from datetime import timedelta
+from airflow import DAG
+from airflow.contrib.operators.databricks_operator import DatabricksRunNowOperator, DatabricksSubmitRunOperator
+from airflow.utils.dates import days_ago
+from airflow.contrib.operators.sns_publish_operator import SnsPublishOperator
+from textwrap import dedent
+import json
+artifact_repo = "[[artifact_bucket]]"
+group_name = "eds_provider"
+module_name = "eds-provider-ct"
+path = f"{group_name}/{module_name}"
+dq_rules = f"{artifact_repo}/{group_name}/{module_name}/configs/dq-rules/"
+raw_zone_configs = f"{artifact_repo}/{group_name}/{module_name}/configs/raw-zone-configs/"
+iz_configs = f"{artifact_repo}/{group_name}/{module_name}/configs/iz-configs/"
+fpz_configs = f"{artifact_repo}/{group_name}/{module_name}/configs/fpz-configs/"
+dags = f"{artifact_repo}/dags/${group_name}/"
+libs = f"{artifact_repo}/{group_name}/{module_name}/libraries/"
+
+
+AIRFLOW_JOB_TIMESTAMP = "{{ execution_date.strftime('%Y%m%d%H%M%S') }}"
+
+def on_task_failure(context):
+
+    print("context['dag']", context)
+    task_instance = context['task_instance']
+    #account = boto3.client('sts').get_caller_identity().get('Account')
+    task_id = task_instance.task_id
+    log_url = task_instance.log_url
+    dag_id = task_instance.dag_id
+    execution_date = task_instance.execution_date
+    tags = ", ".join(context['dag'].tags)
+    env = "[[env]]"
+    message = f"""
+| Env | DAG Id  | Task Id | Execution Date | Status | Tags | Log |
+|---------|---------|---------|---------|---------|--------|--------|
+| {env} | {dag_id} | {task_id} | {execution_date} | Failed | {tags} | [Log URL]({log_url}) |
+"""
+    mattermost_url = "https://mm.sys.cigna.com/hooks/xmzw6p9goi8rjx3z578tnnzcqa"
+    data = {
+        # "channel": "eds_aws_nonprd_alerts",
+        # "username": "airflow-bot",
+        "text": f"{message}"
+    }
+    requests.post(
+        url=mattermost_url,
+        json=data,
+        verify="/usr/local/airflow/dags/ca.pem")
+
+
+DAG_ID = os.path.basename(__file__).replace(".py", "")
+# reff: https://airflow.apache.org/docs/apache-airflow/stable/tutorial.html
+AIRFLOW_JOB_TIMESTAMP = "{{ execution_date.strftime('%Y%m%d%H%M%S') }}"
+
+DEFAULT_ARGS = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'on_failure_callback': on_task_failure,
+    'do_xcom_push': True,
+    'notebook_params': {
+        "AIRFLOW_JOB_TIMESTAMP": f"{AIRFLOW_JOB_TIMESTAMP}",
+        "MWAA_RUN_ID": "{{run_id}}",
+        "load_ctl_key": f"{AIRFLOW_JOB_TIMESTAMP}"
+    }
+}
+
+group_name = "eds_provider"
+module_name = "eds-provider-ct"
+path = f"{group_name}/{module_name}"
+
+#artifact_repo = "[[artifact_bucket]]"
+dq_rules = f"{artifact_repo}/{group_name}/{module_name}/configs/dq-rules/"
+raw_zone_configs = f"{artifact_repo}/{group_name}/{module_name}/configs/raw-zone-configs/"
+iz_configs = f"{artifact_repo}/{group_name}/{module_name}/configs/iz-configs/"
+fpz_configs = f"{artifact_repo}/{group_name}/{module_name}/configs/fpz-configs/"
+dags = f"{artifact_repo}/dags/${group_name}/"
+libs = f"{artifact_repo}/{group_name}/{module_name}/libraries/"
+
+
+
+
+# send SNS notification to provider domain SNS
+#post_sns_notebook = {
+#    'spark_python_task': {
+#        'python_file': f'{libs}send_to_sns.py',
+#        "parameters": [
+#            "provider",
+#            "ptdm_fpz",
+#            "ptdm_cost_trnsprncy_ecn_ntwk",
+#            "arn:aws:sns:us-east-1:[[aws_account]]:cds-domain-provider",
+#            "cost_transparency/provider/ptdm_cost_trnsprncy_ecn_ntwk/date=*/",
+#            "evernorth-us-edp-[[env]]-datashare",
+#            "ptdm",
+#            "full"]}}
+post_sns_notebook_input_dic = {}
+post_sns_notebook_input_dic['domain'] = "provider"
+post_sns_notebook_input_dic['database'] = "ptdm_fpz"
+post_sns_notebook_input_dic['table'] = "ptdm_cost_trnsprncy_ecn_ntwk"
+# arn
+post_sns_notebook_input_dic['topic_arn'] = "arn:aws:sns:us-east-1:[[aws_account]]:cds-domain-provider"
+# s3 bucket
+post_sns_notebook_input_dic['bucket'] = "evernorth-us-edp-[[env]]-datashare"
+post_sns_notebook_input_dic['file_prefix'] = "cost_transparency/provider/ptdm_cost_trnsprncy_ecn_ntwk/date=*/"
+post_sns_notebook_input_dic['source_type'] = "ptdm"
+post_sns_notebook_input_dic['refresh_type'] = "full"
+post_sns_notebook_input_dic['load_ctl_key'] = f"{AIRFLOW_JOB_TIMESTAMP}"
+
+# possible values for refresh_type =full ,
+with DAG(
+        dag_id=DAG_ID,
+        is_paused_upon_creation=False,
+        default_args=DEFAULT_ARGS,
+        dagrun_timeout=timedelta(hours=2),
+        start_date=days_ago(1),
+        schedule_interval="@once",#'30 3 * * *',
+        tags=["eds-provider-ct"]
+) as dag:
+    dag.doc_md = dedent("""
+
+    Moves cost transparency data sources  from CDS Raw to FPZ and at the end send notification to AWS SNS to consumer by downstream
+    ## sources
+    1. NT
+    2. NPO_NT
+    3. NPO
+    4. NPO_MPO
+    5. ECN
+    6. PROCLAIM_NT
+    7. NT_LOB
+    
+    """)
+    #equal to config names
+    table_details = ["nt","nt_lob","npo_nt","npo","npo_mpo","ecn" ,"proclaim_nt"]
+    job_groups_and_config_raw={
+        "provider_ecn_sources":{"notebook_params":{"base_config_location":f"{raw_zone_configs}","config_list":"nt.yaml,nt_lob.yaml,npo_nt.yaml,npo.yaml,npo_mpo.yaml,ecn.yaml,proclaim_nt.yaml", "AIRFLOW_JOB_TIMESTAMP":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+    }
+    raw_zone_tasks=[]
+    iz_taks_name=[]
+    fpz_taks_name=[]
+
+    for key  in job_groups_and_config_raw:
+        # raw to delta raw
+        raw_to_delta_raw = DatabricksRunNowOperator(
+            task_id=f"{key}_raw_to_delta",
+            job_id=[[eds_provider_raw_to_delta_raw]], #261718, #
+            notebook_params = job_groups_and_config_raw[key]['notebook_params'],
+            on_failure_callback=on_task_failure,
+            do_xcom_push=True
+        )
+        raw_zone_tasks.append(raw_to_delta_raw)
+    table_details = ["nt","npo_nt","npo","npo_mpo","ecn" ,"proclaim_nt"]
+    job_groups_and_config_iz={
+        "nt":{"notebook_params":{"configs_location":f"{iz_configs}nt.yaml,{fpz_configs}nt.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+        "nt_lob":{"notebook_params":{"configs_location":f"{iz_configs}nt_lob.yaml,{fpz_configs}nt_lob.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+        "npo_nt":{"notebook_params":{"configs_location":f"{iz_configs}npo_nt.yaml,{fpz_configs}npo_nt.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+        "npo":{"notebook_params":{"configs_location":f"{iz_configs}npo.yaml,{fpz_configs}npo.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+        "npo_mpo":{"notebook_params":{"configs_location":f"{iz_configs}npo_mpo.yaml,{fpz_configs}npo_mpo.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+        "ecn":{"notebook_params":{"configs_location":f"{iz_configs}ecn.yaml,{fpz_configs}ecn.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+        "proclaim_nt":{"notebook_params":{"configs_location":f"{iz_configs}proclaim_nt.yaml,{fpz_configs}proclaim_nt.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+    }
+    #job_groups_and_config_fpz={
+    #    "nt":{"notebook_params":{"configs_location":f"{fpz_configs}nt.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+    #    "npo_nt":{"notebook_params":{"configs_location":f"{fpz_configs}npo_nt.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+    #    "npo":{"notebook_params":{"configs_location":f"{fpz_configs}npo.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+    #    "npo_mpo":{"notebook_params":{"configs_location":f"{fpz_configs}npo_mpo.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+    #    "ecn":{"notebook_params":{"configs_location":f"{fpz_configs}ecn.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+    #    "proclaim_nt":{"notebook_params":{"configs_location":f"{fpz_configs}proclaim_nt.yaml", "load_ctl_key":f"{AIRFLOW_JOB_TIMESTAMP}"}},
+    #
+    #}
+    for key in job_groups_and_config_iz:
+        # iz to fpz table by table by table
+        delta_to_iz = DatabricksRunNowOperator(
+            task_id=f'{key}_delta_to_iz_to_fpz',
+            job_id=[[eds_provider_delta_to_iz]],#261792,
+            notebook_params = job_groups_and_config_iz[key]['notebook_params'],
+            on_failure_callback=on_task_failure,
+            do_xcom_push=True
+        )
+        iz_taks_name.append(delta_to_iz)
+        #iz_to_fpz = DatabricksRunNowOperator(
+        #    task_id=f"{key}_iz_to_fpz",
+        #    job_id=[[eds_provider_delta_to_iz]], #261792,
+        #    notebook_params = job_groups_and_config_fpz[key]['notebook_params'],
+        #    on_failure_callback=on_task_failure,
+        #    do_xcom_push=True
+        #)
+        #fpz_taks_name.append(iz_to_fpz)
+        #delta_to_iz >> iz_to_fpz
+
+    provider_combined_fpz_ct_ecn_file_notebook = DatabricksRunNowOperator(
+        task_id=f"provider_combined_fpz_ct_ecn_file_notebook",
+        job_id=[[eds_provider_ct_provider_fpz]], #261792,
+        notebook_params = {
+            "configs_location": f"{fpz_configs}provider_combined_fpz_ct_ecn_ntwk_file.yaml",
+            "load_ctl_key": f"{AIRFLOW_JOB_TIMESTAMP}"},
+        on_failure_callback=on_task_failure,
+        do_xcom_push=True
+    )
+    # post SNS notification
+    #post_sns = DatabricksSubmitRunOperator(
+    #    task_id='post_sns_notebook',
+    #    run_name="post_sns_notebook",
+    #    new_cluster=new_cluster,
+    #    json=post_sns_notebook,
+    #    libraries=libraries,
+    #    databricks_retry_delay=[[retry_delay]],
+    #    do_xcom_push=True)
+    post_sns = DatabricksRunNowOperator(
+        task_id=f"post_sns",
+        job_id=[[eds_provider_send_notification]], #262121,#
+        notebook_params={"input_json":json.dumps(post_sns_notebook_input_dic)},
+        on_failure_callback=on_task_failure,
+        do_xcom_push=True
+    )
+for  iz_taks in  iz_taks_name:
+    raw_zone_tasks >> iz_taks >> provider_combined_fpz_ct_ecn_file_notebook >> post_sns
+#for  fpz_task in  fpz_taks_name:
+#    fpz_task >> provider_combined_fpz_ct_ecn_file_notebook >> post_sns
+#

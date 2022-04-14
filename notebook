@@ -1,0 +1,953 @@
+import logging
+from pyspark.sql.types import StructType, StructField, StringType, ArrayType, BooleanType, LongType, Row
+from pyspark.sql.functions import  col,struct, explode_outer, posexplode_outer, explode, lit, udf, struct, spark_partition_id, collect_list, lit, from_json, concat
+from datetime import datetime
+from delta.tables import *
+import yaml
+from urllib.parse import urlparse
+import re
+import os
+import boto3
+import traceback
+import json
+import math
+import sys
+import configparser
+
+from pyspark.sql.functions import current_timestamp, lit, input_file_name, row_number, col, concat, md5, trim, col, to_timestamp, to_date, when, expr
+from pyspark.sql.window import Window
+from urllib.parse import urlparse
+from jsonschema import validate
+from datetime import datetime
+from dateutil import relativedelta
+from delta.tables import *
+from common_dq.service.dq_processor import DataQualityProcessor
+from common_dq.service.dq_utils import *
+from pyspark.sql.types import *
+
+import re
+import os
+import json
+#import yaml
+import boto3
+import time
+from decimal import *
+from typing import cast, Dict, List
+from collections import defaultdict
+import watchtower
+import secrets
+
+df=spark.read.json("s3://da-datastore-provider.dev-cignasplithorizon/Cigna_payor_mrf6/date=2022-04-04/2022-04_cigna-health-and-life-insurance-inc_nc002_in_network_rates.json")
+
+df1 = spark.sql(
+        f"""
+    CREATE DATABASE IF NOT EXISTS cost_staging LOCATION 's3://evernorth-us-edp-dev-transformations/eds_provider/' ;
+    """
+    )
+	
+flatten_df = df.select('billing_code','billing_code_type','billing_code_type_version','name','negotiation_arrangement','negotiated_rates')\
+                .withColumn('negotiated_rates_cols', explode('negotiated_rates'))
+
+flatten_df = flatten_df.select('billing_code','billing_code_type','billing_code_type_version','name','negotiation_arrangement','negotiated_rates_cols.*')\
+                .withColumn('negotiated_prices_cols', explode('negotiated_prices'))\
+                .withColumn('provider_groups_cols', explode('provider_groups'))
+
+flatten_df = flatten_df.select('billing_code','billing_code_type','billing_code_type_version','name','negotiation_arrangement','negotiated_prices_cols.*','provider_groups_cols.*')
+
+flatten_df = flatten_df.select('billing_code','billing_code_type','billing_code_type_version','name','negotiation_arrangement','expiration_date','negotiated_rate','negotiated_type','service_codes','npis','tin.type','tin.value')
+
+flatten_df:pyspark.sql.dataframe.DataFrame
+billing_code:string
+billing_code_type:string
+billing_code_type_version:string
+name:string
+negotiation_arrangement:string
+expiration_date:string
+negotiated_rate:double
+negotiated_type:string
+service_codes:array
+element:string
+npis:array
+element:string
+type:string
+value:string
+
+
+1
+flatten_df.show()
+(1) Spark Jobs
++------------+-----------------+-------------------------+--------------------+-----------------------+---------------+---------------+---------------+-------------+----+----+---------+
+|billing_code|billing_code_type|billing_code_type_version|                name|negotiation_arrangement|expiration_date|negotiated_rate|negotiated_type|service_codes|npis|type|    value|
++------------+-----------------+-------------------------+--------------------+-----------------------+---------------+---------------+---------------+-------------+----+----+---------+
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|         171.35|     Negotiated|           []|  []| ein|221899118|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|         171.35|     Negotiated|           []|  []| ein|221869606|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          72.94|     Negotiated|           []|  []| ein|582100288|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          72.94|     Negotiated|           []|  []| ein|311828673|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          72.94|     Negotiated|           []|  []| ein|202661507|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          89.79|     Negotiated|           []|  []| ein|060857901|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          62.28|     Negotiated|           []|  []| ein|592333374|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|593548559|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|260479026|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|300403141|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|450955142|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|593746972|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|141882288|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|753097607|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|593037178|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|593372467|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|593698438|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|593303264|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|592413179|
+|       0575T|              CPT|                     2010|PRGRMG DEV EVAL I...|                    FFS|     9999-12-31|          64.72|     Negotiated|           []|  []| ein|593583279|
++------------+-----------------+-------------------------+--------------------+-----------------------+---------------+---------------+---------------+-------------+----+----+---------+
+only showing top 20 rows
+
+INFO - 2022-04-11 18:55:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 18:55:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 18:55:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 18:55:49 - py4j.java_gateway -  run - Received command c on object id p0
+Command took 0.42 seconds -- by Deepak.Atmuri@evernorth.com at 4/11/2022, 1:55:48 PM on Eds-provider
+1
+flatten_df.dropDuplicates()
+Out[124]: DataFrame[billing_code: string, billing_code_type: string, billing_code_type_version: string, name: string, negotiation_arrangement: string, expiration_date: string, negotiated_rate: double, negotiated_type: string, service_codes: array<string>, npis: array<string>, type: string, value: string]INFO - 2022-04-11 18:55:52 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 18:55:52 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 18:55:52 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 18:55:52 - py4j.java_gateway -  run - Received command c on object id p0
+Command took 0.02 seconds -- by Deepak.Atmuri@evernorth.com at 4/11/2022, 1:55:52 PM on Eds-provider
+
+
+flatten_df = flatten_df.withColumnRenamed('billing_code', 'in_network_billing_code')\
+2
+              .withColumnRenamed('billing_code_type', 'in_network_billing_code_type')\
+3
+              .withColumnRenamed('billing_code_type_version', 'in_network_billing_code_type_version')\
+4
+              .withColumnRenamed('name', 'in_network_name')\
+5
+              .withColumnRenamed('negotiation_arrangement', 'in_network_negotiation_arrangement')\
+6
+              .withColumnRenamed('expiration_date', 'in_network_negotiated_rates_negotiated_prices_expiration_date')\
+7
+              .withColumnRenamed('negotiated_rate', 'in_network_negotiated_rates_negotiated_prices_negotiated_rate')\
+8
+              .withColumnRenamed('negotiated_type', 'in_network_negotiated_rates_negotiated_prices_negotiated_type')\
+9
+              .withColumnRenamed('service_codes', 'in_network_negotiated_rates_negotiated_prices_service_codes')\
+10
+              .withColumnRenamed('npis', 'in_network_negotiated_rates_provider_groups_npis')\
+11
+              .withColumnRenamed('type', 'in_network_negotiated_rates_provider_groups_tin_type')\
+12
+              .withColumnRenamed('value', 'in_network_negotiated_rates_provider_groups_tin_value')
+flatten_df:pyspark.sql.dataframe.DataFrame = [in_network_billing_code: string, in_network_billing_code_type: string ... 10 more fields]
+INFO - 2022-04-11 18:55:58 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 18:55:58 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 18:55:58 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 18:55:58 - py4j.java_gateway -  run - Received command c on object id p0
+Command took 0.04 seconds -- by Deepak.Atmuri@evernorth.com at 4/11/2022, 1:55:58 PM on Eds-provider
+1
+flatten_df.write.option("path", "s3://evernorth-us-edp-dev-transformations/eds_provider/cost_staging/test_nc002_flattened_1/").format("delta").saveAsTable("cost_staging.test_nc002_flattened_1")
+(4) Spark Jobs
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:40 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:41 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:42 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:43 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:44 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:45 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:46 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:47 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:48 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:49 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:50 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:51 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:51 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:51 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:51 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:51 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:51 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:51 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:01:51 - py4j.java_gateway -  run - Received command c on object id p0
+
+*** WARNING: skipped 1197469 bytes of output ***
+
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:19 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:20 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:21 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:22 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:23 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:24 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:25 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:26 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:27 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:28 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+INFO - 2022-04-11 19:10:29 - py4j.java_gateway -  run - Received command c on object id p0
+Command took 8.83 minutes -- by Deepak.Atmuri@evernorth.com at 4/11/2022, 2:01:39 PM on Eds-provider
+1
+ df.write.option("path", "s3://evernorth-us-edp-dev-transformations/eds_provider/cost_staging/test_nc002/").format("delta").saveAsTable("cost_staging.test_nc002")
+2
+     
+(4) Spark Jobs
+Command took 11.35 seconds -- by Deepak.Atmuri@evernorth.com at 4/6/2022, 12:05:44 PM on Eds-provider
+1
+ 
+2
+df.write.saveAsTable("cost_staging.table_test") ;
+(4) Spark Jobs
+Command took 51.04 seconds -- by Deepak.Atmuri@evernorth.com at 4/6/2022, 10:30:07 AM on Cost_Transparency
+1
+df.head()
+NameError: name 'df' is not defined
+Command took 1.69 seconds -- by Deepak.Atmuri@evernorth.com at 4/11/2022, 10:41:05 AM on Eds-provider
+1
+%sql
+2
+select * from cost_staging.test_nc002 limit 20;
+(1) Spark Jobs
+Table
+Data Profile
+ 
+_corrupt_record
+billing_code
+billing_code_type
+billing_code_type_version
+description
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+{"reporting_entity_name":"Cigna Health and Life Insurance, Inc","reporting_entity_type":"payer","reporting_plans":[{"plan_name":"CIGNA COMPANIES_CIGNA SUREFIT UNC HEALTH ALLIANCE","plan_id":"190101800","plan_id_type":"ein","plan_marker_type":"Group"},{"plan_name":"AIMS CA SUREFIT SBS PCLM FEB 18 MO NC AZ_CIGNA SUREFIT UNC HEALTH ALLIANCE","plan_id":"171002800","plan_id_type":"ein","plan_marker_type":"Group"},{"plan_name":"SUREFIT ACCOUNT 2_CIGNA SUREFIT UNC HEALTH ALLIANCE","plan_id":"200802600"...
+null
+null
+null
+null
+"in_network":[
+null
+null
+null
+null
+null
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+null
+20102
+CPT
+1810
+EXPL PENETRAT WOUND-SEP PROC; ABD/FLANK/BACK
+null
+20983
+CPT
+1610
+ABLATE BONE TUMOR(S) PERQ
+null
+21750
+CPT
+1810
+CLOS MEDIAN STERNOTOMY SEP W/WO DEBRID SEP PROC
+null
+25405
+CPT
+1810
+REPR NONUNION/MALUNION RADIUS/ULNA; W/AUTOGRAFT
+null
+30901
+CPT
+1810
+CONTROL NASAL HEMORRHAGE ANT SIMPLE ANY METHOD
+null
+33322
+CPT
+1810
+SUTURE REPAIR AORTA/GREAT VESSELS; W/CP BYPS
+null
+33420
+CPT
+1810
+VALVOTOMY MITRAL VALVE; CLOSED HEART
+null
+33521
+CPT
+1810
+COR ART BYPASS W/VENOUS & ART GFT; 4 VEIN GFT
+null
+34831
+CPT
+1810
+OPN REPR AORTIC ANEUR; AORTO-BI-ILIAC PROSTH
+null
+35151
+CPT
+1810
+DIR REP ANEUR/EXC&GFT; ASSOC OCCL DZ POP ART
+Showing all 20 rows.
+
+ 
+
+Command took 1.72 minutes -- by Deepak.Atmuri@evernorth.com at 4/6/2022, 1:19:40 PM on Eds-provider
+1
+%sql
+2
+select * from cost_staging.test_nc002_flattened_1 limit 20;
+(1) Spark Jobs
+Table
+Data Profile
+ 
+in_network_billing_code
+in_network_billing_code_type
+in_network_billing_code_type_version
+in_network_name
+in_network_negotiation_arrangement
+in_network_negotiated_rates_negotiated_prices_expiration_date
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+0575T
+CPT
+2010
+PRGRMG DEV EVAL ICDS SS IP
+FFS
+9999-12-31
+Showing all 20 rows.
+
+ 
+
+Command took 57.16 seconds -- by Deepak.Atmuri@evernorth.com at 4/11/2022, 3:58:18 PM on Eds-provider				

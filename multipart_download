@@ -1,0 +1,399 @@
+import sys
+
+# extract file size from URL
+def get_file_size(url):
+    import requests
+    resp = requests.get(url, verify=False)
+    try:
+        if resp.status_code >= 200 and resp.status_code < 300:
+          return resp.headers['Content-Length'], "success"
+        else:
+          return -1, "Failure"
+    except:
+        return -1, "Failure"
+		
+# create upload id for multipart upload
+def create_upload_id(provider_name, drop_bucket_name,gofus_bucket, content_len, file_name_key):
+    import requests
+    import json
+    import boto3
+    import datetime
+    cur_dt = datetime.datetime.utcnow().today().strftime("%Y-%m-%d")
+    content_len = int(content_len)
+    if content_len < 5242881:
+        upload_id = None
+        key = None
+        buck_name = None
+        temp_list = None
+    elif content_len >= 4294967296:
+        # drop bucket
+        if file_name_key.split('.')[-1].lower() in ('json', 'csv', 'xml', 'txt', 'text'):
+            file_path = "clinical-gov_fpz/{datasetname}/date={isodate}".format(datasetname=provider_name, isodate=cur_dt)  # determine date from runtime
+        else:
+            file_path = "clinical-gov_fpz/temp/{datasetname}/date={isodate}".format(datasetname=provider_name, isodate=cur_dt)  # determine date from runtime
+        #fileName = provider_name+"_"+cur_dt
+        fileName = file_name_key
+        key = file_path + "/" + fileName
+        temp_list = [drop_bucket_name, key]
+    elif content_len > 0 and content_len < 4294967296:
+        # gofus bucket
+        if file_name_key.split('.')[-1].lower() in ('json', 'csv', 'xml', 'txt', 'text'):
+            file_path = "clinical-gov_fpz/{datasetname}/date={isodate}".format(datasetname=provider_name, isodate=cur_dt)  # determine date from runtime
+        else:
+            file_path = "clinical-gov_fpz/temp/{datasetname}/date={isodate}".format(datasetname=provider_name, isodate=cur_dt)  # determine date from runtime
+        #fileName = provider_name + "_" + cur_dt
+        fileName = file_name_key
+        key = file_path + "/" + fileName
+        temp_list = [gofus_bucket, key]
+    else:
+        temp_list = None
+    if temp_list != None:
+        s3 = boto3.client('s3')
+        mpu = s3.create_multipart_upload(Bucket=temp_list[0], Key=temp_list[1])
+        upload_id = mpu['UploadId']
+        key = temp_list[1]
+        buck_name = temp_list[0]
+    else:
+        upload_id = None
+        key = None
+        buck_name = None
+    return upload_id, key, buck_name
+	
+# create chunk sizes for multipart upload
+def get_bin_sizes(total_file_size, download_threshold_in_bytes, upload_id):
+    download_threshold_in_bytes=5242880
+    if upload_id == None:
+        return [[-1, -1]]
+    else:
+        download_threshold = download_threshold_in_bytes
+        return_byte_ranges=[]
+        start_bit = 0
+        total_file_size = int(total_file_size)
+    while(start_bit<int(total_file_size)):
+        end_bit = start_bit+download_threshold
+        return_byte_ranges.append([start_bit, end_bit])
+        start_bit = end_bit+1
+    return return_byte_ranges
+    
+# create etag value for each chunk
+def create_multi_part_download(start_byte, end_byte, url, bucket_name, key, part_num, upload_id):
+    try:
+        import requests
+        import boto3
+        import json
+        import datetime
+
+        s3 = boto3.client('s3')
+        chunk_s = 'bytes={}-{}'.format(start_byte, end_byte)
+        resume_header = {'Range':chunk_s}
+        r = requests.get(url, stream=True, headers=resume_header, verify=False)
+        cur_dt = datetime.datetime.now().strftime("%Y%m%d")
+
+        part1 = s3.upload_part(Bucket=bucket_name
+                             , Key=key
+                             , PartNumber=part_num
+                             , UploadId=upload_id
+                             , Body=r.content)
+        etag_val = part1['ETag']
+        return etag_val
+    except:
+        return part_num
+	
+# abort all multipart uploads in case of failure
+def abort_all_uploads(key, upload_id, bucket):
+    import boto3
+    s3 = boto3.client('s3')
+    response = s3.abort_multipart_upload(
+    Bucket=bucket,
+    Key=key,
+    UploadId=upload_id
+    )
+    
+# complete multipart_upload
+def complete_multi_p_file_download(key, upload_id, bucket):
+    try:
+        import boto3
+        s3 = boto3.client('s3')
+        part_response = s3.list_parts(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id)
+        import json
+        parts = part_response['Parts']
+        parts = json.dumps(parts, default=str)
+        parts = json.loads(parts)
+        for ele in parts:
+            del ele['LastModified']
+            del ele['Size']
+        formated_parts = {}
+        formated_parts['Parts'] = parts
+        s3.complete_multipart_upload(Bucket=bucket
+                                     , Key=key
+                                     , UploadId=upload_id
+                                     , MultipartUpload=formated_parts)
+        return "Successful multipart upload", None
+
+    except Exception as e:
+        abort_all_uploads(key, upload_id, bucket)
+        return "Failed multipart upload", e
+	
+def get_file_size_on_s3(s3_file_location, bucketname):
+    import boto3
+    s3 = boto3.resource('s3')
+    object = s3.Object(bucketname,s3_file_location)
+    return object.content_length
+    
+# get file size from URL
+def get_file_content_length_from_URL(url):
+    import requests
+    import json
+    resp = requests.get(url,verify=False)
+    try:
+      size_on_provider_url = resp.headers['Content-Length']
+      print(size_on_provider_url)
+    except:
+      size_on_provider_url = -1
+    return int(size_on_provider_url)
+    
+#
+def get_complete_file_content(url,drop_bucket_name,provider_name, file_name_key):
+    import requests
+    import json
+    import datetime
+    resp = requests.get(url,verify=False)
+    if resp.status_code >= 200 and resp.status_code <300:
+
+        import boto3
+        s3_rersource = boto3.resource('s3')
+        cur_dt = datetime.datetime.utcnow().today().strftime("%Y-%m-%d")
+        print("Entered into Complete file Content Function")
+        if file_name_key.split('.')[-1].lower() in ('json', 'csv', 'xml', 'txt', 'text'):
+            file_path = "clinical-gov_fpz/{datasetname}/date={isodate}".format(datasetname=provider_name, isodate=cur_dt)  # determine date from runtime
+        else:
+            file_path = "clinical-gov_fpz/temp/{datasetname}/date={isodate}".format(datasetname=provider_name, isodate=cur_dt)  # determine date from runtime
+        #fileName = provider_name + "_" + cur_dt
+        fileName = file_name_key
+        n_file_name = file_path + "/" + fileName
+        s3_rersource.Object(drop_bucket_name, n_file_name).put(Body = resp.content)
+
+        content_len_url = get_file_content_length_from_URL(url)
+        content_len_on_disk = get_file_size_on_s3(n_file_name, drop_bucket_name)
+        print("content_len_url is {}".format(content_len_url))
+        print("content_len_on_disk is {}".format(content_len_on_disk))
+        if int(content_len_url)==int(content_len_on_disk):
+            stat = "Success"
+        elif content_len_url== -1:
+            stat= "content lenght missing in header info"
+        else:
+            stat= "Failure"
+        ex = None
+    else:
+        stat = "response code is not sucess"
+        ex = None
+        n_file_name = None
+    return stat, ex, n_file_name
+	
+# unzip file
+def unzip_file_on_s3(drop_bucket_name, source_location,target_location):
+    import boto3
+    from io import BytesIO
+    import zipfile
+    import gzip
+    import bz2
+    try:
+        s3 = boto3.resource('s3')
+        s3_cli = boto3.client('s3')
+        bucket = s3.Bucket(drop_bucket_name)
+        target_bucket = drop_bucket_name
+        status = "success"
+        cur_dt12 = datetime.datetime.utcnow().today().strftime("%Y-%m-%d")
+        target_location = f"clinical-gov_fpz/{provider_name}/date={cur_dt12}"
+        print("target bucket is {}".format(target_bucket))
+        print(source_location)
+        print(target_location)
+        for obj in bucket.objects.filter(Prefix=source_location):
+          print("For Loop Entered")
+          print("For Loop Entered Bucket is ",bucket)
+          print("For Loop Entered Source Location is ",source_location)
+          print("For Loop Entered target_location  is ",target_location)
+          json_object = s3_cli.get_object(Bucket=bucket.name, Key=obj.key)
+          print("Json Object is",json_object)
+          target_key = obj.key
+          target_key1 = target_key.split('/')[-1]
+          target_key2 = target_key1.split('.')[-3] + ".json"
+          uncompressed_key = target_location + "/" + target_key2
+          print("target_key",target_key)
+          print("uncompressed_key",uncompressed_key)
+          s3 = boto3.client('s3')
+          s3.upload_fileobj(Fileobj=gzip.GzipFile(None,'rb',fileobj=BytesIO(s3.get_object(Bucket=target_bucket, Key=target_key)['Body'].read())),Bucket=target_bucket,Key=uncompressed_key)
+    except:
+        status = "failure"
+    return status 
+
+def get_relative_urls(url):
+  child_url_list = []
+  table_list = ["2022-02-23"]
+  resp = requests.get(url, verify=False)
+  if resp.status_code < 300 and resp.status_code >= 200:
+    resp = resp.json()
+    for i in resp['mrfs']:
+      program =  i['program']
+      
+      for file in i['files']:
+        
+        if file['last_updated_on'] in table_list:    
+          child_url_list.append(file['url'])
+          child_url_list1 = child_url_list[0:3]
+          print("child_url_list1 file Contents", child_url_list1)
+       
+  return child_url_list1
+  
+if __name__ == '__main__':
+    import datetime
+    import requests
+    print("script started...")
+    url = 'https://a-edp-evernorth.test.digitaledge.evernorth.com/public/v1/mrfs'
+    provider_name = 'goutham_test3'
+    cur_dt11 = datetime.datetime.utcnow().today().strftime("%Y-%m-%d")
+    source_location = f"clinical-gov_fpz/temp/{provider_name}/date={cur_dt11}"
+    target_location = f"clinical-gov_fpz/{provider_name}/date={cur_dt11}"
+    print(url)
+    print(provider_name)
+    print(source_location)
+    print(target_location)
+
+    
+    # extract url and parameter name from incoming json string
+    import json
+    # define global final variables
+    drop_bucket_name = "da-datastore-clinical-gov.dev-cignasplithorizon"
+    gofus_bucket_name = "cds-internal-dropzone.dev-cignasplithorizon"
+    
+    child_url_list = get_relative_urls(url)
+    child_url_w_file_name = {}
+    for url in child_url_list:
+        try:
+          try:
+            import os
+            from urllib.parse import urlparse
+            parsedurl = urlparse(url)
+            filename_key = os.path.basename(parsedurl.path)
+            child_url_w_file_name[url] = filename_key
+          except:
+            if "Content-disposition"  in gethead.headers :
+              filename_key = gethead.headers['Content-disposition']
+              child_url_w_file_name[url] = filename_key
+        except:
+          import datetime
+          cur_dt = datetime.datetime.utcnow().today().strftime("%Y-%m-%d")
+          filename_key = provider_name + "_" + cur_dt
+          child_url_w_file_name[url] = filename_key
+
+
+    download_threshold_in_bytes = 5242880
+    url_parallel_limit_var = 2
+    retry_limit = 3
+
+    # create pands dataframe with input variables
+    import pandas as pd
+    data = []
+    for i, j in child_url_w_file_name.items():
+        data.append([provider_name, i, drop_bucket_name, gofus_bucket_name, download_threshold_in_bytes,
+             url_parallel_limit_var, j])
+    columns = ["provider_name", "url", "DropZoneFolder", "GoFusFolder", "download_threshold_in_bytes",
+               "url_parallel_limit_var", "filename_key"]
+    relative_url_pd = pd.DataFrame(data, columns=columns)
+    
+    # add content lenght to pandas df
+    relative_url_pd["content_length"] = ''
+    relative_url_pd["get_content_len_status"] = ''
+    for index, row in relative_url_pd.iterrows():
+        relative_url_pd.at[index, 'content_length'], relative_url_pd.at[index, 'get_content_len_status'] = get_file_size(row['url'])
+
+    # update dataframe with upload ID and key
+    relative_url_pd["upload_id"] = ''
+    relative_url_pd["upload_key"] = ''
+    relative_url_pd["download_bucket_name"] = ''
+    for index, row in relative_url_pd.iterrows():
+        relative_url_pd.at[index, 'upload_id'], relative_url_pd.at[index, 'upload_key'], relative_url_pd.at[
+            index, 'download_bucket_name'] = create_upload_id(row['provider_name'], row['GoFusFolder'],
+                                                              row['DropZoneFolder'], row['content_length'], row['filename_key'])
+
+    # add bin values to dataframe- and split start byte and end byte
+    relative_url_pd["bins"] = ''
+    for index, row in relative_url_pd.iterrows():
+        # tmp = get_bin_sizes(row['content_length'],download_threshold_in_bytes, row['upload_id'])
+        relative_url_pd.at[index, 'bins'] = get_bin_sizes(row['content_length'], download_threshold_in_bytes,
+                                                          row['upload_id'])
+    relative_url_pd = relative_url_pd.explode('bins')
+    relative_url_pd[['start_byte', 'end_byte']] = pd.DataFrame(relative_url_pd.bins.tolist(),
+                                                               index=relative_url_pd.index)
+
+
+    # add part number to dataframe- used in multi part upload
+    relative_url_pd["part_num"] = relative_url_pd.groupby(['provider_name'])['start_byte'].rank("dense",
+                                                                                    ascending=True).astype(int)
+
+    # direct downloads
+    relative_url_pd_direct_download = relative_url_pd[relative_url_pd.upload_id.isnull()][
+        ["provider_name", "url"]].drop_duplicates()
+
+    # multi part downloads
+    relative_url_pd_multi_part_download = relative_url_pd[~relative_url_pd.upload_id.isnull()][
+        ["provider_name"]].drop_duplicates()
+    distint_list_multi_part = relative_url_pd_multi_part_download.to_dict('records')
+
+    # parallely run multipart upalod- with max limit of url paralllel limit
+    for i in distint_list_multi_part:
+        t_relative_url_pd = relative_url_pd.loc[(relative_url_pd.provider_name == i['provider_name'])]
+        print("the relative url pd at line 99 is ", t_relative_url_pd)
+        import concurrent.futures
+        with concurrent.futures.ProcessPoolExecutor(int(url_parallel_limit_var)) as pool:
+            # t_relative_url_pd['etag_val']
+            tmp_val = pd.Series(list(
+                pool.map(create_multi_part_download, t_relative_url_pd['start_byte'], t_relative_url_pd['end_byte'],
+                         t_relative_url_pd['url'], t_relative_url_pd['download_bucket_name'],
+                         t_relative_url_pd['upload_key'], t_relative_url_pd['part_num'], t_relative_url_pd['upload_id'],
+                         chunksize=5)))
+        print(tmp_val)
+
+    # complete multipart upload or run complete downloader
+    relative_url_pd["final_upload_status"] = ''
+    relative_url_pd["final_upload_failure_reason"] = ''
+    relative_url_pd["final_downloaded_location"] = ''
+    relative_url_pd = relative_url_pd[
+        ['provider_name', 'url', 'final_upload_status', 'final_upload_failure_reason', 'upload_id', 'upload_key',
+         'DropZoneFolder']].drop_duplicates()
+    for index, row in relative_url_pd.iterrows():
+        i=0
+        if row['upload_id'] != None:
+            relative_url_pd.at[index, 'final_upload_status'], relative_url_pd.at[
+                index, 'final_upload_failure_reason'] = complete_multi_p_file_download(row['upload_key'],
+                                                                                       row['upload_id'], 
+                                                                                       row['DropZoneFolder'])
+            print("Entered into line 123")
+            i=i+1
+            print("the value of i at line 123 is", i)
+            print("the filename key at line 123 is", filename_key)
+        else:
+            print("Entered into line 125")
+            i=i+1
+            print("the value of i at line 125 is", i)
+            print("the filename key at line 125 is", filename_key)
+            relative_url_pd.at[index, 'final_upload_status'], relative_url_pd.at[index, 'final_upload_failure_reason'], \
+            relative_url_pd.at[index, 'final_downloaded_location'] = get_complete_file_content(row['url'],row['DropZoneFolder'],row['provider_name'],row['filename_key'])
+            
+    
+    relative_url_pd["unzip_status"] = ''
+    for index, row in relative_url_pd.iterrows():
+      if row['upload_key'].split('/')[-1].split('.')[-1].lower() in ('json', 'csv', 'xml', 'txt', 'text'):
+        relative_url_pd.at[index, 'unzip_status'] = "original file is non archived"
+      else:
+        relative_url_pd.at[index, 'unzip_status'] = unzip_file_on_s3(drop_bucket_name,source_location,target_location)
+    
+    print("completed")
+    for index, row in relative_url_pd.iterrows():
+      if row['final_upload_failure_reason'] != None:
+        print("#######failure reason###########")
+        print(row['final_upload_failure_reason'])
+        sys.exit("script failed")
